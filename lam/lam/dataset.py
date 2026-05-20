@@ -486,7 +486,7 @@ class LightningVideoDataset(LightningDataset):
             )
             self.val_dataset = MultiSourceSamplerDataset(
                 data_root=self.data_root,
-                env_source="procgen",
+                env_source=self.env_source,
                 split="test",
                 padding=self.padding,
                 randomize=self.randomize,

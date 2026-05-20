@@ -1,3 +1,10 @@
+
+/Release/
+/data/
+/lam/exp_ckpts_a2d/
+/lam/exp_imgs_a2d/
+/lam/exp_logs_a2d/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
