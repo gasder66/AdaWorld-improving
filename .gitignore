@@ -5,6 +5,8 @@
 /lam/exp_imgs_a2d/
 /lam/exp_logs_a2d/
 /lam/umap/
+/data/synthetic_multi_actor/
+/lam/results/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

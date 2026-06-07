@@ -28,6 +28,8 @@ class LAM(LightningModule):
             lam_dec_blocks: int = 8,
             lam_num_heads: int = 8,
             lam_dropout: float = 0.0,
+            num_slots: int = 1,
+            use_slot_competition: bool = False,
             beta: float = 0.01,
             log_interval: int = 1000,
             log_path: str = "log_imgs",
@@ -42,7 +44,9 @@ class LAM(LightningModule):
             enc_blocks=lam_enc_blocks,
             dec_blocks=lam_dec_blocks,
             num_heads=lam_num_heads,
-            dropout=lam_dropout
+            dropout=lam_dropout,
+            num_slots=num_slots,
+            use_slot_competition=use_slot_competition,
         )
         self.beta = beta
         self.log_interval = log_interval
@@ -57,7 +61,10 @@ class LAM(LightningModule):
 
         # Compute loss
         mse_loss = ((gt_future_frames - outputs["recon"]) ** 2).mean()
-        kl_loss = -0.5 * torch.sum(1 + outputs["z_var"] - outputs["z_mu"] ** 2 - outputs["z_var"].exp(), dim=1).mean()
+        # z_mu, z_var: (B*(T-1), K, latent_dim) — 对所有 slot 和 latent_dim 求和
+        kl_loss = -0.5 * torch.sum(
+            1 + outputs["z_var"] - outputs["z_mu"] ** 2 - outputs["z_var"].exp()
+        ) / outputs["z_mu"].shape[0]  # 对 batch 维度取平均
         loss = mse_loss + self.beta * kl_loss
 
         # Compute monitoring measurements

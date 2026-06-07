@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>改进方向 LAM 数据流详细分析</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: #f0f2f5;
+    padding: 30px 20px;
+    color: #333;
+    line-height: 1.6;
+  }
+  h1 { text-align: center; font-size: 24px; margin-bottom: 6px; color: #1a1a2e; }
+  .subtitle { text-align: center; font-size: 14px; color: #888; margin-bottom: 30px; }
+
+  .container {
+    max-width: 1100px; margin: 0 auto 30px;
+    background: white; border-radius: 16px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    padding: 36px 32px;
+  }
+
+  .scenario {
+    background: #f8fafc; border-radius: 10px; padding: 16px 20px;
+    margin-bottom: 24px; border: 1px solid #e2e8f0;
+  }
+  .scenario h3 { font-size: 15px; color: #475569; margin-bottom: 8px; }
+  .scenario .detail { font-size: 13px; color: #64748b; }
+
+  /* Step card */
+  .step {
+    margin-bottom: 24px; padding: 20px;
+    border-radius: 12px; border-left: 5px solid;
+    background: white;
+  }
+  .step-num {
+    display: inline-block; width: 28px; height: 28px;
+    border-radius: 50%; color: white; font-size: 13px; font-weight: 700;
+    text-align: center; line-height: 28px; margin-right: 8px;
+  }
+  .step h3 { font-size: 16px; margin-bottom: 10px; display: flex; align-items: center; }
+
+  /* Tensor shape display */
+  .tensor-box {
+    background: #1e293b; color: #e2e8f0; border-radius: 8px;
+    padding: 12px 16px; font-family: 'Fira Code', 'Consolas', monospace;
+    font-size: 13px; margin: 10px 0; line-height: 1.7;
+    overflow-x: auto;
+  }
+  .tensor-box .shape { color: #fbbf24; font-weight: 600; }
+  .tensor-box .value { color: #34d399; }
+  .tensor-box .comment { color: #94a3b8; font-style: italic; }
+  .tensor-box .highlight { color: #f87171; font-weight: 600; }
+  .tensor-box .new { color: #fb923c; font-weight: 600; }
+
+  /* Arrow between steps */
+  .step-arrow {
+    text-align: center; font-size: 22px; color: #94a3b8;
+    margin: -8px 0 8px; font-weight: 700;
+  }
+
+  /* Description text */
+  .desc { font-size: 13px; color: #475569; margin: 8px 0; line-height: 1.7; }
+  .desc b { color: #1e293b; }
+  .desc .key { color: #dc2626; font-weight: 600; }
+  .desc .new-tag {
+    background: #fff7ed; color: #c2410c; padding: 1px 6px;
+    border-radius: 3px; font-size: 11px; font-weight: 600;
+  }
+  .desc .same-tag {
+    background: #f1f5f9; color: #64748b; padding: 1px 6px;
+    border-radius: 3px; font-size: 11px; font-weight: 600;
+  }
+  .desc .diff-tag {
+    background: #fef2f2; color: #991b1b; padding: 1px 6px;
+    border-radius: 3px; font-size: 11px; font-weight: 600;
+  }
+
+  /* Insight box */
+  .insight {
+    background: #eff6ff; border: 2px solid #93c5fd; border-radius: 8px;
+    padding: 12px 16px; margin: 12px 0; font-size: 13px; color: #1e3a5f;
+  }
+  .insight.warn {
+    background: #fef2f2; border-color: #fca5a5; color: #7f1d1d;
+  }
+  .insight.good {
+    background: #ecfdf5; border-color: #6ee7b7; color: #064e3b;
+  }
+  .insight b { font-weight: 700; }
+
+  /* Comparison with original */
+  .compare-row {
+    display: flex; gap: 16px; margin: 12px 0;
+  }
+  .compare-col {
+    flex: 1; padding: 12px; border-radius: 8px; font-size: 12px;
+  }
+  .compare-col.orig { background: #eef2ff; border: 1px solid #c7d2fe; }
+  .compare-col.impr { background: #fff7ed; border: 1px solid #fed7aa; }
+  .compare-col h4 { font-size: 13px; margin-bottom: 6px; }
+  .compare-col.orig h4 { color: #4338ca; }
+  .compare-col.impr h4 { color: #c2410c; }
+
+  /* 2D Matrix visualization */
+  .matrix-vis {
+    display: inline-flex; align-items: flex-start; gap: 16px;
+    margin: 16px 0;
+  }
+  .matrix-label-v {
+    writing-mode: vertical-lr; text-orientation: mixed;
+    font-size: 12px; font-weight: 600; color: #f59e0b;
+    transform: rotate(180deg); margin-top: 24px;
+  }
+  .matrix-grid {
+    display: grid; gap: 3px;
+  }
+  .matrix-cell {
+    width: 56px; height: 32px; border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 9px; font-weight: 600; color: white;
+  }
+  .matrix-label-h {
+    font-size: 12px; font-weight: 600; color: #f59e0b; margin-top: 4px; text-align: center;
+  }
+  .matrix-label-row {
+    display: flex; flex-direction: column; gap: 3px; justify-content: center;
+    margin-right: 4px;
+  }
+  .matrix-label-cell {
+    height: 32px; display: flex; align-items: center; justify-content: flex-end;
+    font-size: 10px; color: #666; padding-right: 4px;
+  }
+
+  /* Flow summary */
+  .flow-summary {
+    display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;
+    margin: 16px 0; align-items: center;
+  }
+  .flow-node {
+    padding: 8px 14px; border-radius: 8px; font-size: 12px; font-weight: 600;
+    text-align: center; min-width: 80px;
+  }
+  .flow-arrow { font-size: 16px; color: #94a3b8; font-weight: 700; }
+
+  /* Attention pattern visualization */
+  .attn-vis {
+    display: flex; gap: 24px; margin: 16px 0; justify-content: center;
+  }
+  .attn-pattern {
+    text-align: center;
+  }
+  .attn-pattern .title {
+    font-size: 12px; font-weight: 600; margin-bottom: 8px;
+  }
+  .attn-grid {
+    display: grid; gap: 2px; margin: 0 auto;
+  }
+  .attn-cell {
+    width: 20px; height: 20px; border-radius: 2px;
+  }
+</style>
+</head>
+<body>
+
+<h1>改进方向 LAM 数据流详细分析</h1>
+<p class="subtitle">基于架构图中"多主体感知 + 单向量输出"的改进方向，以具体视频为例逐步追踪数据流</p>
+
+<!-- ==================== Scenario Setup ==================== -->
+<div class="container">
+  <div class="scenario">
+    <h3>示例视频场景</h3>
+    <div class="detail">
+      一个 256×256 的视频，包含 <b>3 个彩色方块</b>（红、绿、蓝）在棋盘格背景上运动。<br>
+      视频共 <b>5 帧</b>，每帧 256×256 RGB。3 个方块分别执行不同的动作（向右、向上、静止）。<br><br>
+      <b>模型配置</b>：patch_size=16, model_dim=256, latent_dim=32, max_actors=3<br>
+      <b>Batch</b>：B=2（2 个视频一起训练）<br><br>
+      <b>与当前代码实现的关键区别</b>：<br>
+      &bull; 主体数 A=3 + 背景槽 = A+1=4 个对象槽（当前代码无背景槽）<br>
+      &bull; 逐帧检测模块（YOLO/LocateAnything）生成 mask（当前代码用 GT mask）<br>
+      &bull; 对象级时空注意力处理 (A+1)×T 二维矩阵（当前代码用简单 Transformer Self-Attention）<br>
+      &bull; Mean Pool 聚合回单向量 z̃ ∈ R³²（当前代码输出多向量）
+    </div>
+  </div>
+
+  <!-- ==================== Step 1: Input ==================== -->
+  <div class="step" style="border-color: #6366f1">
+    <h3><span class="step-num" style="background:#6366f1">1</span> 视频输入</h3>
+
+    <div class="tensor-box">
+      <span class="comment"># 视频帧：5帧，每帧 256×256 RGB，float32 [0,1]</span><br>
+      videos.shape = <span class="shape">(2, 5, 256, 256, 3)</span><br>
+      <span class="comment">#   B=2, T=5, H=256, W=256, C=3</span>
+    </div>
+
+    <div class="desc">
+      <span class="same-tag">与原始相同</span> 输入只有视频帧，不需要预先提供 GT mask。
+      mask 将由步骤 2 的检测模块自动生成。
+    </div>
+  </div>
+
+  <div class="step-arrow">↓</div>
+
+  <!-- ==================== Step 2: Detection ==================== -->
+  <div class="step" style="border-color: #f97316">
+    <h3><span class="step-num" style="background:#f97316">2</span> 逐帧检测：识别并分割画面中的主体 <span class="new-tag">新增</span></h3>
+
+    <div class="tensor-box">
+      <span class="comment"># 对每一帧独立运行检测模型</span><br>
+      <span class="comment"># 方案 A：YOLO 检测 → bbox → 填充为矩形 mask</span><br>
+      <span class="comment"># 方案 B：LocateAnything → bbox → SAM2 → 精确像素级 mask</span><br><br>
+      <span class="comment"># 以 YOLO 方案为例：</span><br>
+      <span class="comment">#   对 videos[b, t] 运行 YOLO，得到 K 个 bbox + 类别</span><br>
+      <span class="comment">#   用 ByteTrack 跨帧关联，分配 track ID</span><br>
+      <span class="comment">#   将 bbox 填充为二值矩形 mask</span><br><br>
+      <span class="comment"># 检测结果：</span><br>
+      detected_masks.shape = <span class="shape">(2, 5, 3, 256, 256)</span> <span class="new">← 检测生成</span><br>
+      <span class="comment">#   B=2, T=5, A=3, H=256, W=256</span><br>
+      <span class="comment">#   detected_masks[b, t, a] = 第b个视频、第t帧、第a个主体的检测mask</span><br>
+      <span class="comment">#   例如 detected_masks[0, 0, 0] = 红色方块的矩形mask</span><br><br>
+      <span class="comment"># 同时构造背景mask：</span><br>
+      bg_mask = 1 - detected_masks.sum(dim=2, keepdim=True).clip(0, 1)<br>
+      bg_mask.shape = <span class="shape">(2, 5, 1, 256, 256)</span> <span class="new">← 背景槽</span><br><br>
+      <span class="comment"># 合并：背景 + 主体 → A+1 个对象槽</span><br>
+      all_masks = cat([bg_mask, detected_masks], dim=2)<br>
+      all_masks.shape = <span class="shape">(2, 5, 4, 256, 256)</span> <span class="new">← 含背景</span><br>
+      <span class="comment">#   第0个槽 = 背景，第1-3个槽 = 红/绿/蓝方块</span>
+    </div>
+
+    <div class="desc">
+      <b>检测模块的作用</b>：将"哪些像素属于哪个主体"这个先验知识注入模型。<br>
+      <b>背景槽</b>：背景也占一个槽位，确保背景区域的特征不被忽略。<br><br>
+      <span class="key">与当前代码的区别</span>：当前代码直接使用 GT mask，且没有背景槽。
+      改进方向用检测模型自动生成 mask，并显式加入背景槽。
+    </div>
+
+    <div class="compare-row">
+      <div class="compare-col orig">
+        <h4>原始 LAM</h4>
+        无检测模块<br>
+        依赖 prompt token 隐式聚合<br>
+        <span style="font-size:11px;color:#64748b">不知道"哪里有主体"</span>
+      </div>
+      <div class="compare-col impr">
+        <h4>改进方向</h4>
+        YOLO/LocateAnything 检测<br>
+        自动生成 mask + 背景槽<br>
+        <span style="font-size:11px;color:#c2410c">显式知道"哪里有主体"</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="step-arrow">↓</div>
+
+  <!-- ==================== Step 3: Patchify + Encode ==================== -->
+  <div class="step" style="border-color: #8b5cf6">
+    <h3><span class="step-num" style="background:#8b5cf6">3</span> Patchify + SpatioTemporal Transformer 编码</h3>
+
+    <div class="tensor-box">
+      <span class="comment"># 1. Patchify：将视频帧切分为 patch</span><br>
+      <span class="comment">#    patch_size=16, 每帧 16×16=256 个 patch，每个 768 维</span><br>
+      patches = patchify(videos, patch_size=16)<br>
+      patches.shape = <span class="shape">(2, 5, 256, 768)</span><br>
+      <span class="comment">#   B=2, T=5, N=256, D_patch=768</span><br><br>
+      <span class="comment"># 2. SpatioTemporal Transformer 编码（与原始 AdaWorld 完全相同）</span><br>
+      <span class="comment">#    768 → 256 维，4个block</span><br>
+      <span class="comment">#    每个block: Spatial Attn + Temporal Attn + FFN</span><br>
+      encoded = self.encoder(patches)<br>
+      encoded.shape = <span class="shape">(2, 5, 256, 256)</span><br>
+      <span class="comment">#   B=2, T=5, N=256, model_dim=256</span><br>
+      <span class="comment">#   encoded[b, t, n] = 第b个视频、第t帧、第n个patch的256维特征</span>
+    </div>
+
+    <div class="desc">
+      <span class="same-tag">与原始相同</span> 编码器结构完全不变。<br>
+      <b>关键区别</b>：原始 LAM 在 patchify 后拼接 action_prompt token（257 个 token），
+      编码后提取 prompt 输出作为隐动作。改进方向<b>不拼接 prompt</b>，编码后用 mask 池化提取主体特征。
+    </div>
+
+    <div class="insight">
+      <b>编码器做了什么？</b><br>
+      Spatial Attention：每个 patch 可以"看到"同一帧内所有其他 patch → 捕捉空间关系<br>
+      Temporal Attention：每个 patch 可以"看到"其他帧同一位置的 patch → 捕捉时序变化<br>
+      经过 4 层后，每个 patch 的特征已经融合了全局时空信息。
+    </div>
+  </div>
+
+  <div class="step-arrow">↓</div>
+
+  <!-- ==================== Step 4: Mask Pooling ==================== -->
+  <div class="step" style="border-color: #f59e0b">
+    <h3><span class="step-num" style="background:#f59e0b">4</span> Mask Pooling：按对象槽池化 patch 特征（含背景） <span class="new-tag">新增</span></h3>
+
+    <div class="tensor-box">
+      <span class="comment"># 1. 将 mask 下采样到 patch 级别</span><br>
+      <span class="comment">#    all_masks: (2, 5, 4, 256, 256) → adaptive_avg_pool2d → (2, 5, 4, 16, 16) → flatten</span><br>
+      masks_down.shape = <span class="shape">(2, 5, 4, 256)</span><br>
+      <span class="comment">#    masks_down[b, t, a, n] = 第a个对象槽在第n个patch区域的占比</span><br>
+      <span class="comment">#    例如 masks_down[0, 0, 0, 42] = 0.0 表示背景不覆盖第42号patch</span><br>
+      <span class="comment">#         masks_down[0, 0, 1, 42] = 0.85 表示红色方块覆盖了第42号patch的85%</span><br><br>
+      <span class="comment"># 2. 加权平均池化</span><br>
+      <span class="comment">#    weights = masks_down.unsqueeze(-1)  → (2, 5, 4, 256, 1)</span><br>
+      <span class="comment">#    feat = encoded.unsqueeze(2) * weights → (2, 5, 4, 256, 256)</span><br>
+      <span class="comment">#    obj_feats = feat.sum(dim=-2) / mask_sum → (2, 5, 4, 256)</span><br><br>
+      obj_feats, valid_mask = self.mask_pool(encoded, all_masks)<br>
+      obj_feats.shape = <span class="shape">(2, 5, 4, 256)</span> <span class="new">← 含背景槽</span><br>
+      <span class="comment">#   B=2, T=5, A+1=4, model_dim=256</span><br>
+      <span class="comment">#   obj_feats[b, t, 0] = 背景的256维聚合特征</span><br>
+      <span class="comment">#   obj_feats[b, t, 1] = 红色方块的256维聚合特征</span><br>
+      <span class="comment">#   obj_feats[b, t, 2] = 绿色方块的256维聚合特征</span><br>
+      <span class="comment">#   obj_feats[b, t, 3] = 蓝色方块的256维聚合特征</span><br><br>
+      valid_mask.shape = <span class="shape">(2, 5, 4)</span><br>
+      <span class="comment">#   valid_mask[b, t, a] = True/False，该对象槽在该帧是否存在</span><br>
+      <span class="comment">#   背景槽始终 valid=True</span>
+    </div>
+
+    <div class="desc">
+      <b>Mask Pooling 的直觉</b>：把属于同一个对象（主体或背景）的所有 patch 特征加权平均，得到该对象的"整体特征"。<br><br>
+      <span class="key">与当前代码的区别</span>：当前代码只池化主体（A=3），没有背景槽。
+      改进方向加入背景槽（A+1=4），确保背景区域的特征也被显式建模。
+    </div>
+
+    <!-- 2D Matrix visualization -->
+    <div style="margin-top:20px; text-align:center">
+      <div style="font-size:14px; font-weight:600; color:#1a1a2e; margin-bottom:12px">
+        池化后形成的特征二维矩阵
+      </div>
+      <div class="matrix-vis">
+        <div class="matrix-label-v">对象槽 (A+1=4)</div>
+        <div>
+          <div style="display:flex; align-items:center">
+            <div class="matrix-label-row">
+              <div class="matrix-label-cell">背景</div>
+              <div class="matrix-label-cell">红块</div>
+              <div class="matrix-label-cell">绿块</div>
+              <div class="matrix-label-cell">蓝块</div>
+            </div>
+            <div class="matrix-grid" style="grid-template-columns:repeat(5,56px); grid-template-rows:repeat(4,32px)">
+              <div class="matrix-cell" style="background:#6b7280">f<sub>0</sub><sup>bg</sup></div>
+              <div class="matrix-cell" style="background:#6b7280">f<sub>1</sub><sup>bg</sup></div>
+              <div class="matrix-cell" style="background:#6b7280">f<sub>2</sub><sup>bg</sup></div>
+              <div class="matrix-cell" style="background:#6b7280">f<sub>3</sub><sup>bg</sup></div>
+              <div class="matrix-cell" style="background:#6b7280">f<sub>4</sub><sup>bg</sup></div>
+              <div class="matrix-cell" style="background:#ef4444">f<sub>0</sub><sup>1</sup></div>
+              <div class="matrix-cell" style="background:#ef4444">f<sub>1</sub><sup>1</sup></div>
+              <div class="matrix-cell" style="background:#ef4444">f<sub>2</sub><sup>1</sup></div>
+              <div class="matrix-cell" style="background:#ef4444">f<sub>3</sub><sup>1</sup></div>
+              <div class="matrix-cell" style="background:#ef4444">f<sub>4</sub><sup>1</sup></div>
+              <div class="matrix-cell" style="background:#3b82f6">f<sub>0</sub><sup>2</sup></div>
+              <div class="matrix-cell" style="background:#3b82f6">f<sub>1</sub><sup>2</sup></div>
+              <div class="matrix-cell" style="background:#3b82f6">f<sub>2</sub><sup>2</sup></div>
+              <div class="matrix-cell" style="background:#3b82f6">f<sub>3</sub><sup>2</sup></div>
+              <div class="matrix-cell" style="background:#3b82f6">f<sub>4</sub><sup>2</sup></div>
+              <div class="matrix-cell" style="background:#10b981">f<sub>0</sub><sup>3</sup></div>
+              <div class="matrix-cell" style="background:#10b981">f<sub>1</sub><sup>3</sup></div>
+              <div class="matrix-cell" style="background:#10b981">f<sub>2</sub><sup>3</sup></div>
+              <div class="matrix-cell" style="background:#10b981">f<sub>3</sub><sup>3</sup></div>
+              <div class="matrix-cell" style="background:#10b981">f<sub>4</sub><sup>3</sup></div>
+            </div>
+          </div>
+          <div class="matrix-label-h">时序 (T=5)</div>
+        </div>
+      </div>
+      <div style="font-size:11px; color:#888; margin-top:8px">
+        每个格子是一个 256 维向量。行 = 对象槽，列 = 时序帧。
+      </div>
+    </div>
+  </div>
+
+  <div class="step-arrow">↓</div>
+
+  <!-- ==================== Step 5: Object-level Spatiotemporal Attention ==================== -->
+  <div class="step" style="border-color: #ec4899">
+    <h3><span class="step-num" style="background:#ec4899">5</span> 对象级时空注意力：主体间交互 + 时序动态 <span class="new-tag">新增</span></h3>
+
+    <div class="desc">
+      这是最核心的改进步骤。对上面的 (A+1)×T 二维特征矩阵施加时空自注意力，
+      让不同对象槽之间和不同时序之间充分交互。
+    </div>
+
+    <div class="tensor-box">
+      <span class="comment"># 将 (B, T, A+1, D) 重排为 (B, (A+1)*T, D) 的序列</span><br>
+      <span class="comment"># 每个样本 = 4个对象槽 × 5帧 = 20个token</span><br>
+      seq = obj_feats.reshape(2, 20, 256)    <span class="comment"># (2, 20, 256)</span><br><br>
+      <span class="comment"># 对这个 20-token 序列做 Transformer Self-Attention</span><br>
+      <span class="comment"># 注意力模式：</span><br>
+      <span class="comment">#   - 同一帧内跨对象槽：背景↔红块↔绿块↔蓝块（空间注意力）</span><br>
+      <span class="comment">#   - 同一对象跨帧：红块@t0↔红块@t1↔...↔红块@t4（时间注意力）</span><br>
+      <span class="comment">#   - 全交互：任意token可以attend到任意其他token</span><br><br>
+      obj_feats_refined = self.obj_st_attention(seq, padding_mask=...)<br>
+      obj_feats_refined.shape = <span class="shape">(2, 20, 256)</span> <span class="new">← 新增</span><br><br>
+      <span class="comment"># 重排回 (B, T, A+1, D)</span><br>
+      obj_feats_refined = obj_feats_refined.reshape(2, 5, 4, 256)<br>
+      obj_feats_refined.shape = <span class="shape">(2, 5, 4, 256)</span><br>
+      <span class="comment">#   形状不变，但每个对象槽的特征已经融合了：</span><br>
+      <span class="comment">#   - 其他对象在同一帧的信息（主体间交互）</span><br>
+      <span class="comment">#   - 自身跨帧的动态信息（时序动态）</span>
+    </div>
+
+    <!-- Attention pattern visualization -->
+    <div style="margin-top:16px; text-align:center">
+      <div style="font-size:13px; font-weight:600; color:#1a1a2e; margin-bottom:12px">
+        注意力交互模式示意（以红块@t2 为例）
+      </div>
+      <div class="attn-vis">
+        <div class="attn-pattern">
+          <div class="title" style="color:#ef4444">空间注意力（同一帧跨主体）</div>
+          <div style="font-size:11px; color:#888; margin-bottom:6px">红块@t2 关注同帧其他对象</div>
+          <div class="matrix-grid" style="grid-template-columns:repeat(5,20px); grid-template-rows:repeat(4,20px)">
+            <div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div>
+            <div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#fca5a5"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div>
+            <div class="attn-cell" style="background:#fecaca"></div><div class="attn-cell" style="background:#fecaca"></div><div class="attn-cell" style="background:#ef4444"></div><div class="attn-cell" style="background:#fecaca"></div><div class="attn-cell" style="background:#fecaca"></div>
+            <div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#fca5a5"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div>
+          </div>
+          <div style="font-size:10px; color:#888; margin-top:4px">深红=自身，浅红=同帧交互</div>
+        </div>
+        <div class="attn-pattern">
+          <div class="title" style="color:#3b82f6">时间注意力（同一主体跨帧）</div>
+          <div style="font-size:11px; color:#888; margin-bottom:6px">红块@t2 关注自身其他帧</div>
+          <div class="matrix-grid" style="grid-template-columns:repeat(5,20px); grid-template-rows:repeat(4,20px)">
+            <div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div>
+            <div class="attn-cell" style="background:#bfdbfe"></div><div class="attn-cell" style="background:#93c5fd"></div><div class="attn-cell" style="background:#ef4444"></div><div class="attn-cell" style="background:#93c5fd"></div><div class="attn-cell" style="background:#bfdbfe"></div>
+            <div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div>
+            <div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div><div class="attn-cell" style="background:#e5e7eb"></div>
+          </div>
+          <div style="font-size:10px; color:#888; margin-top:4px">深红=自身，蓝色=同主体跨帧</div>
+        </div>
+        <div class="attn-pattern">
+          <div class="title" style="color:#8b5cf6">全交互（任意token间）</div>
+          <div style="font-size:11px; color:#888; margin-bottom:6px">标准 Self-Attention 全连接</div>
+          <div class="matrix-grid" style="grid-template-columns:repeat(5,20px); grid-template-rows:repeat(4,20px)">
+            <div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div>
+            <div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#ef4444"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div>
+            <div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div>
+            <div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div><div class="attn-cell" style="background:#c4b5fd"></div>
+          </div>
+          <div style="font-size:10px; color:#888; margin-top:4px">紫色=全交互，红=自身</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="desc" style="margin-top:16px">
+      <span class="diff-tag">与当前代码的区别</span> 当前代码的 Interaction Module 只在隐动作空间（32维）做主体间交互，
+      且是<b>差分后</b>的交互。改进方向在<b>特征空间</b>（256维）做时空注意力，<b>差分前</b>就交互，
+      信息量更丰富，且同时建模空间关系和时序动态。
+    </div>
+
+    <div class="insight">
+      <b>为什么在特征空间而非隐动作空间做交互？</b><br>
+      1. 特征空间维度更高（256 vs 32），信息更丰富<br>
+      2. 交互在差分前进行，模型可以同时看到"是什么"和"怎么变"<br>
+      3. 时空注意力让每个对象槽同时理解"其他主体在做什么"和"自己随时间如何变化"<br>
+      4. 类比：原始 LAM 的 SpatioTemporal Transformer 在 patch 级做时空注意力；<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;改进后在对象级做时空注意力——粒度更粗但语义更明确
+    </div>
+  </div>
+
+  <div class="step-arrow">↓</div>
+
+  <!-- ==================== Step 6: Temporal Differencing ==================== -->
+  <div class="step" style="border-color: #f59e0b">
+    <h3><span class="step-num" style="background:#f59e0b">6</span> Temporal Differencing：帧间特征差分 <span class="new-tag">新增</span></h3>
+
+    <div class="tensor-box">
+      <span class="comment"># 对每个对象槽，计算相邻帧之间的特征差</span><br>
+      <span class="comment"># 差分 = "这一帧相比上一帧变了什么" ≈ 运动信息</span><br>
+      delta = obj_feats_refined[:, 1:] - obj_feats_refined[:, :-1]<br>
+      delta.shape = <span class="shape">(2, 4, 4, 256)</span> <span class="new">← 新增</span><br>
+      <span class="comment">#   B=2, T-1=4, A+1=4, model_dim=256</span><br>
+      <span class="comment">#   delta[b, t, 0] = 背景的帧间特征差（通常很小，背景静止）</span><br>
+      <span class="comment">#   delta[b, t, 1] = 红色方块的帧间特征差 ≈ 向右运动的信息</span><br>
+      <span class="comment">#   delta[b, t, 2] = 绿色方块的帧间特征差 ≈ 向上运动的信息</span><br>
+      <span class="comment">#   delta[b, t, 3] = 蓝色方块的帧间特征差 ≈ 静止（差分接近0）</span>
+    </div>
+
+    <div class="desc">
+      <b>差分在时空注意力之后</b>：先让对象槽充分交互，再计算差分。<br>
+      这样差分不仅包含"自身的变化"，还融合了"其他主体的影响"。<br><br>
+      <span class="key">与当前代码的区别</span>：当前代码在差分后才做交互。改进方向先交互再差分，
+      让差分信息更丰富。
+    </div>
+  </div>
+
+  <div class="step-arrow">↓</div>
+
+  <!-- ==================== Step 7: Aggregation + VAE ==================== -->
+  <div class="step" style="border-color: #d97706">
+    <h3><span class="step-num" style="background:#d97706">7</span> 聚合 + VAE：多主体特征压缩回单向量 <span class="new-tag">新增 · 关键</span></h3>
+
+    <div class="tensor-box">
+      <span class="comment"># 1. 跨对象槽 Mean Pooling：4个对象槽的特征取平均</span><br>
+      <span class="comment">#    (2, 4, 4, 256) → (2, 4, 256)</span><br>
+      delta_global = delta.mean(dim=2)    <span class="comment"># 对 A+1 维度求平均</span><br>
+      delta_global.shape = <span class="shape">(2, 4, 256)</span> <span class="new">← 聚合为单向量</span><br>
+      <span class="comment">#   B=2, T-1=4, model_dim=256</span><br>
+      <span class="comment">#   delta_global[b, t] = 所有对象槽帧间差分的平均值</span><br>
+      <span class="comment">#   = 融合了背景+红块+绿块+蓝块的运动信息</span><br><br>
+      <span class="comment"># 2. VAE 编码：256 → 32 维隐动作</span><br>
+      <span class="comment">#    与原始 LAM 相同的 VAE 结构</span><br>
+      delta_flat = delta_global.reshape(-1, 256)   <span class="comment"># (8, 256)</span><br>
+      moments = self.vae_fc(delta_flat)             <span class="comment"># (8, 64)</span><br>
+      z_mu, z_var = chunk(moments, 2, dim=-1)      <span class="comment"># 各 (8, 32)</span><br>
+      z_rep = z_mu + noise * exp(0.5 * z_var)      <span class="comment"># (8, 32) 重参数化</span><br><br>
+      z_rep = z_rep.reshape(2, 4, 32)<br>
+      z_rep.shape = <span class="shape">(2, 4, 32)</span> <span class="new">← 单向量输出</span><br>
+      <span class="comment">#   B=2, T-1=4, latent_dim=32</span><br>
+      <span class="comment">#   z_rep[b, t] = 第b个视频、第t个时间步的32维全局隐动作</span><br>
+      <span class="comment">#   这个隐动作融合了所有主体的运动信息</span>
+    </div>
+
+    <div class="desc">
+      <b>这是改进方向最关键的设计</b>：多主体特征通过 Mean Pooling 聚合回<b>单向量 z̃ ∈ R³²</b>。<br><br>
+      <span class="key">与当前代码的根本区别</span>：当前代码输出多向量 (B, T-1, A, 32)，
+      每个主体一个独立的 32 维隐动作。改进方向聚合为单向量 (B, T-1, 32)，
+      <b>与原始 LAM 的输出接口完全兼容</b>。
+    </div>
+
+    <div class="compare-row">
+      <div class="compare-col orig">
+        <h4>原始 LAM</h4>
+        1 个 prompt → VAE → z̃ ∈ R³²<br>
+        <span style="font-size:11px;color:#64748b">隐式压缩，不知道主体</span>
+      </div>
+      <div class="compare-col impr">
+        <h4>改进方向</h4>
+        A+1 个对象槽 → Mean Pool → VAE → z̃ ∈ R³²<br>
+        <span style="font-size:11px;color:#c2410c">显式分离后聚合，知道主体</span>
+      </div>
+    </div>
+
+    <div class="insight good">
+      <b>为什么聚合回单向量？</b><br>
+      1. <b>接口兼容</b>：z̃ ∈ R³² 可以直接喂给世界模型的 VideoPredictionEmbedder，无需修改下游<br>
+      2. <b>信息瓶颈</b>：单向量迫使模型在聚合时做选择——哪些运动信息最重要？<br>
+      3. <b>类比</b>：原始 LAM 的 prompt 是"盲人摸象"——1 个 token 猜测哪里有运动；<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;改进后是"先看清再总结"——先显式分离每个主体，再压缩成一句话<br>
+      4. <b>关键优势</b>：处理过程更精细（多主体感知+交互），但输出更简洁（单向量）
+    </div>
+  </div>
+
+  <div class="step-arrow">↓</div>
+
+  <!-- ==================== Step 8: Decoder ==================== -->
+  <div class="step" style="border-color: #7c3aed">
+    <h3><span class="step-num" style="background:#7c3aed">8</span> Decoder：用隐动作重建视频帧</h3>
+
+    <div class="tensor-box">
+      <span class="comment"># 与原始 AdaWorld LAM 的 Decoder 完全相同</span><br><br>
+      <span class="comment"># 1. 将 patch 特征和隐动作映射到相同维度</span><br>
+      video_patches = self.patch_up(patches[:, :-1])  <span class="comment"># (2, 4, 256, 256)</span><br>
+      action_embed = self.action_up(z_rep)             <span class="comment"># (2, 4, 256)</span><br>
+      <span class="comment">#   32维隐动作 → 256维，只有1个动作slot（与原始相同）</span><br><br>
+      <span class="comment"># 2. Cross-Attention: patch 作为 query，动作 embed 作为 key/value</span><br>
+      v_p = video_patches.reshape(8, 256, 256)  <span class="comment"># (8, 256, 256)</span><br>
+      a_e = action_embed.reshape(8, 1, 256)      <span class="comment"># (8, 1, 256) ← 单slot</span><br>
+      fused = self.cross_attn(q=v_p, kv=a_e)     <span class="comment"># (8, 256, 256)</span><br><br>
+      <span class="comment"># 3. 残差连接 + SpatioTransformer 解码</span><br>
+      video_action_patches = fused + video_patches  <span class="comment"># 残差</span><br>
+      recon_patches = self.decoder(video_action_patches) <span class="comment"># (8, 256, 768)</span><br>
+      recon = unpatchify(recon_patches, 16, 256, 256)    <span class="comment"># (2, 4, 256, 256, 3)</span><br>
+      recon = sigmoid(recon)<br>
+      recon.shape = <span class="shape">(2, 4, 256, 256, 3)</span><br>
+      <span class="comment">#   B=2, T-1=4, H=256, W=256, C=3</span>
+    </div>
+
+    <div class="desc">
+      <span class="same-tag">与原始相同</span> Decoder 结构完全一致。<br>
+      <span class="diff-tag">与当前代码的区别</span>：当前代码的 Decoder 用 4 个动作 slot 做 Cross-Attention
+      （每个主体一个 slot）。改进方向只有 1 个动作 embed（单向量），与原始 LAM 完全一致。
+    </div>
+
+    <div class="compare-row">
+      <div class="compare-col orig">
+        <h4>原始 LAM</h4>
+        1 个动作 slot → Cross-Attn<br>
+        a_e: (8, <b>1</b>, 256)<br>
+        <span style="font-size:11px;color:#64748b">单slot，与原始一致</span>
+      </div>
+      <div class="compare-col impr">
+        <h4>改进方向</h4>
+        1 个动作 embed → Cross-Attn<br>
+        a_e: (8, <b>1</b>, 256)<br>
+        <span style="font-size:11px;color:#c2410c">单slot，与原始一致</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="step-arrow">↓</div>
+
+  <!-- ==================== Step 9: Loss ==================== -->
+  <div class="step" style="border-color: #ef4444">
+    <h3><span class="step-num" style="background:#ef4444">9</span> 损失函数</h3>
+
+    <div class="tensor-box">
+      <span class="comment"># 1. 重建损失（场景级，与原始相同）</span><br>
+      L_recon = MSE(recon, videos[:, 1:])<br>
+      <span class="comment">#   recon: (2, 4, 256, 256, 3) vs videos[:, 1:]: (2, 4, 256, 256, 3)</span><br><br>
+      <span class="comment"># 2. KL 散度（单向量，与原始相同）</span><br>
+      L_KL = KL(q(z̃ | delta_global) || p(z̃))<br>
+      <span class="comment">#   只有一个 VAE，一个 KL 项</span><br><br>
+      <span class="comment"># 3. 总损失</span><br>
+      L = L_recon + β · L_KL<br>
+      <span class="comment">#   β 通常从 0 增长到 1e-6（KL annealing）</span>
+    </div>
+
+    <div class="desc">
+      <span class="same-tag">与原始相同</span> 损失函数结构与原始 LAM 完全一致：重建 + KL。<br>
+      <span class="diff-tag">与当前代码的区别</span>：当前代码有 A 个独立的 KL 项（每主体一个），
+      改进方向只有 1 个 KL 项（单向量 VAE）。
+    </div>
+  </div>
+
+  <!-- ==================== Summary ==================== -->
+  <div class="container" style="margin-top: 20px">
+    <h3 style="font-size:18px; margin-bottom:16px; color:#1a1a2e">完整数据流总结</h3>
+
+    <div class="flow-summary">
+      <div class="flow-node" style="background:#eef2ff; color:#4338ca; border:2px solid #6366f1">
+        视频输入<br><small>(2,5,256,256,3)</small>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-node" style="background:#fff7ed; color:#c2410c; border:2px solid #f97316">
+        逐帧检测<br><small>YOLO/LA</small>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-node" style="background:#f5f3ff; color:#6d28d9; border:2px solid #8b5cf6">
+        Patchify + ST-Trans<br><small>(2,5,256,256)</small>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-node" style="background:#fef9c3; color:#854d0e; border:2px dashed #eab308">
+        Mask Pool<br><small>(2,5,4,256)</small>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-node" style="background:#fce7f3; color:#9d174d; border:2px solid #ec4899">
+        对象级时空Attn<br><small>(2,5,4,256)</small>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-node" style="background:#fef3c7; color:#92400e; border:2px solid #d97706">
+        差分+聚合+VAE<br><small>(2,4,32)</small>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-node" style="background:#ede9fe; color:#5b21b6; border:2px solid #7c3aed">
+        Cross-Attn Decoder<br><small>(2,4,256,256,3)</small>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-node" style="background:#fee2e2; color:#991b1b; border:2px solid #ef4444">
+        Loss<br><small>L_recon + β·KL</small>
+      </div>
+    </div>
+
+    <div style="margin-top:24px">
+      <h4 style="font-size:15px; margin-bottom:10px; color:#1a1a2e">张量形状变化一览</h4>
+      <table style="width:100%; border-collapse:collapse; font-size:12px">
+        <thead>
+          <tr style="background:#f8fafc">
+            <th style="padding:8px; text-align:left; border-bottom:2px solid #e2e8f0">步骤</th>
+            <th style="padding:8px; text-align:left; border-bottom:2px solid #e2e8f0">操作</th>
+            <th style="padding:8px; text-align:left; border-bottom:2px solid #e2e8f0">输出形状</th>
+            <th style="padding:8px; text-align:left; border-bottom:2px solid #e2e8f0">语义</th>
+            <th style="padding:8px; text-align:left; border-bottom:2px solid #e2e8f0">与原始LAM</th>
+            <th style="padding:8px; text-align:left; border-bottom:2px solid #e2e8f0">与当前代码</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="padding:6px 8px">1</td>
+            <td>视频输入</td>
+            <td style="font-family:monospace">(2,5,256,256,3)</td>
+            <td>视频帧</td>
+            <td style="color:#64748b">相同</td>
+            <td style="color:#64748b">相同</td>
+          </tr>
+          <tr style="background:#fff7ed">
+            <td style="padding:6px 8px">2</td>
+            <td>逐帧检测</td>
+            <td style="font-family:monospace">(2,5,4,256,256)</td>
+            <td>mask(含背景)</td>
+            <td style="color:#c2410c;font-weight:600">新增</td>
+            <td style="color:#991b1b;font-weight:600">不同：自动检测+背景槽</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 8px">3</td>
+            <td>Patchify + ST-Trans</td>
+            <td style="font-family:monospace">(2,5,256,256)</td>
+            <td>编码后Patch</td>
+            <td style="color:#64748b">相同</td>
+            <td style="color:#64748b">相同</td>
+          </tr>
+          <tr style="background:#fff7ed">
+            <td style="padding:6px 8px">4</td>
+            <td>Mask Pool</td>
+            <td style="font-family:monospace">(2,5,4,256)</td>
+            <td>每对象槽特征</td>
+            <td style="color:#c2410c;font-weight:600">新增</td>
+            <td style="color:#991b1b;font-weight:600">不同：A+1含背景</td>
+          </tr>
+          <tr style="background:#fce7f3">
+            <td style="padding:6px 8px">5</td>
+            <td>对象级时空Attn</td>
+            <td style="font-family:monospace">(2,5,4,256)</td>
+            <td>交互后特征</td>
+            <td style="color:#c2410c;font-weight:600">新增</td>
+            <td style="color:#991b1b;font-weight:600">不同：特征空间+时空</td>
+          </tr>
+          <tr style="background:#fff7ed">
+            <td style="padding:6px 8px">6</td>
+            <td>Temporal Diff</td>
+            <td style="font-family:monospace">(2,4,4,256)</td>
+            <td>帧间差分</td>
+            <td style="color:#c2410c;font-weight:600">新增</td>
+            <td style="color:#991b1b;font-weight:600">不同：交互后差分</td>
+          </tr>
+          <tr style="background:#fef3c7">
+            <td style="padding:6px 8px">7</td>
+            <td>Mean Pool + VAE</td>
+            <td style="font-family:monospace">(2,4,32)</td>
+            <td>全局隐动作</td>
+            <td style="color:#c2410c;font-weight:600">新增</td>
+            <td style="color:#991b1b;font-weight:600">根本不同：单向量</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 8px">8</td>
+            <td>Decoder</td>
+            <td style="font-family:monospace">(2,4,256,256,3)</td>
+            <td>重建帧</td>
+            <td style="color:#64748b">相同</td>
+            <td style="color:#991b1b;font-weight:600">不同：单slot</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 8px">9</td>
+            <td>Loss</td>
+            <td style="font-family:monospace">scalar</td>
+            <td>L_recon + β·KL</td>
+            <td style="color:#64748b">相同</td>
+            <td style="color:#991b1b;font-weight:600">不同：单KL</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ==================== Key Differences ==================== -->
+  <div class="container" style="margin-top: 20px">
+    <h3 style="font-size:18px; margin-bottom:16px; color:#1a1a2e">改进方向 vs 当前代码：关键差异</h3>
+
+    <table style="width:100%; border-collapse:collapse; font-size:13px">
+      <thead>
+        <tr style="background:#f8fafc">
+          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">维度</th>
+          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">当前代码实现</th>
+          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">改进方向（架构图）</th>
+          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">为什么改</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td style="padding:8px 10px; font-weight:600">mask 来源</td>
+          <td style="padding:8px 10px">GT mask（数据集提供）</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">YOLO/LocateAnything 自动检测</td>
+          <td style="padding:8px 10px; font-size:12px">真实场景无 GT mask</td>
+        </tr>
+        <tr style="background:#f8fafc">
+          <td style="padding:8px 10px; font-weight:600">背景槽</td>
+          <td style="padding:8px 10px">无（只池化主体）</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">有（A+1，含背景）</td>
+          <td style="padding:8px 10px; font-size:12px">背景特征不应被忽略</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 10px; font-weight:600">交互位置</td>
+          <td style="padding:8px 10px">差分后，隐动作空间(32d)</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">差分前，特征空间(256d)</td>
+          <td style="padding:8px 10px; font-size:12px">特征空间信息更丰富</td>
+        </tr>
+        <tr style="background:#f8fafc">
+          <td style="padding:8px 10px; font-weight:600">交互类型</td>
+          <td style="padding:8px 10px">简单 Self-Attn（仅跨主体）</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">时空注意力（跨主体+跨帧）</td>
+          <td style="padding:8px 10px; font-size:12px">同时建模空间和时序关系</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 10px; font-weight:600">VAE 结构</td>
+          <td style="padding:8px 10px">Per-Object VAE（A个独立fc）</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">单 VAE（聚合后1个fc）</td>
+          <td style="padding:8px 10px; font-size:12px">输出单向量，兼容下游</td>
+        </tr>
+        <tr style="background:#f8fafc">
+          <td style="padding:8px 10px; font-weight:600">输出形状</td>
+          <td style="padding:8px 10px">(B, T-1, A, 32) 多向量</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">(B, T-1, 32) 单向量</td>
+          <td style="padding:8px 10px; font-size:12px">与原始LAM接口兼容</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 10px; font-weight:600">Decoder Cross-Attn</td>
+          <td style="padding:8px 10px">4个动作slot</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">1个动作embed</td>
+          <td style="padding:8px 10px; font-size:12px">与原始LAM Decoder一致</td>
+        </tr>
+        <tr style="background:#f8fafc">
+          <td style="padding:8px 10px; font-weight:600">KL 项数</td>
+          <td style="padding:8px 10px">A 个独立 KL</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">1 个 KL</td>
+          <td style="padding:8px 10px; font-size:12px">与原始LAM损失一致</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 10px; font-weight:600">世界模型兼容</td>
+          <td style="padding:8px 10px; color:#991b1b">不兼容（需修改）</td>
+          <td style="padding:8px 10px; color:#059669; font-weight:600">完全兼容</td>
+          <td style="padding:8px 10px; font-size:12px">z̃∈R³²直接喂入</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="insight good" style="margin-top:20px">
+      <b>改进方向的核心原则：处理能力增强，输出接口不变</b><br><br>
+      <b>新增部分</b>（步骤 2, 4, 5）：检测分割 → 主体级特征 → 时空交互<br>
+      <b>保留部分</b>（步骤 3, 8, 9）：原始编码器、解码器、损失函数不变<br>
+      <b>关键桥梁</b>（步骤 7）：Mean Pool 将多主体特征聚合回单向量 z̃ ∈ R³²<br><br>
+      <b>类比</b>：原始 LAM 的 action_prompt 是"盲人摸象"——1 个 token 必须从全局 attention 中猜测哪里有运动。<br>
+      改进后：先用检测"看见"每个主体，再让它们交互，最后压缩回 1 个向量——<b>看得更清楚，但说的还是一句话</b>。
+    </div>
+
+    <div class="insight" style="margin-top:16px">
+      <b>与下游世界模型的衔接</b><br><br>
+      改进方向输出 z̃ ∈ R³² → squeeze → (B,1,32) crossattn + (B,32) vector → VideoUNet<br>
+      与原始 LAM 的接口完全一致，<b>世界模型无需任何修改</b>。<br><br>
+      适配阶段：ActionBook / ActionMLP 将真实动作映射到 R³²，替代 LAM 输出，流程不变。
+    </div>
+  </div>
+
+</body>
+</html>

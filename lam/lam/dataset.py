@@ -471,6 +471,23 @@ class LightningVideoDataset(LightningDataset):
         self.save_hyperparameters()
 
     def setup(self, stage: str) -> None:
+        if self.env_source == "synthetic":
+            from lam.synthetic_dataset import SyntheticMultiActorDataModule
+            dm = SyntheticMultiActorDataModule(
+                resolution=self.resolution,
+                num_frames=self.num_frames,
+                samples_per_epoch=self.samples_per_epoch,
+                batch_size=self.batch_size if not hasattr(self, 'val_batch_size') else self.batch_size,
+                num_workers=self.num_workers,
+            )
+            dm.setup(stage)
+            if stage == "fit":
+                self.train_dataset = dm.train_dataset
+                self.val_dataset = dm.val_dataset
+            elif stage == "test":
+                self.test_dataset = dm.test_dataset
+            return
+
         if stage == "fit":
             self.train_dataset = MultiSourceSamplerDataset(
                 data_root=self.data_root,
