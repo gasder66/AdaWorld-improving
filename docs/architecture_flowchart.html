@@ -254,7 +254,7 @@
 
 <!-- ==================== Section 2: Improved Architecture ==================== -->
 <div class="diagram-container">
-  <div class="section-title improved">二、改进方案：多主体感知 + 单向量输出</div>
+  <div class="section-title improved">二、改进方案：多主体感知 + 多向量输出（无监督）</div>
 
   <div class="flow">
     <!-- Step 1: Input -->
@@ -326,15 +326,14 @@
       </div>
       <div class="pipeline-arrow"><div class="arrow-right"></div></div>
 
-      <!-- Step 6: Aggregation -->
+      <!-- Step 6: Per-Object VAE -->
       <div class="pipeline-step improved">
         <div class="step-num">6</div>
-        <div class="box box-aggregate">
-          <div class="box-title">聚合 + VAE</div>
+        <div class="box box-bottleneck">
+          <div class="box-title">Per-Object VAE</div>
           <div class="box-detail">
-            Mean Pool → VAE<br>
-            <span style="color:#92400e;font-weight:600">关键：压缩回单向量</span><br>
-            z̃ ∈ R<sup>32</sup>
+            <span style="color:#92400e;font-weight:600">每个主体独立 VAE</span><br>
+            (A+1) × z̃ ∈ R<sup>32</sup>
           </div>
         </div>
       </div>
@@ -355,12 +354,13 @@
 
     <div class="arrow-down" style="height:12px"></div>
 
-    <!-- Loss -->
+    <!-- Loss (no action supervision) -->
     <div class="flow-row">
       <div class="box box-loss" style="min-width:340px">
-        <div class="box-title">训练损失</div>
+        <div class="box-title">训练损失（无监督）</div>
         <div class="box-detail">
-          L = L<sub>recon</sub> + β · KL + <span style="color:#c2410c;font-weight:600">λ · L<sub>obj_recon</sub></span>（可选：对象级重建）
+          L = L<sub>recon</sub> + β · KL + <span style="color:#c2410c;font-weight:600">λ · L<sub>obj_recon</sub></span><br>
+          L<sub>obj_recon</sub>: 从隐动作预测下一帧的每主体特征
         </div>
       </div>
     </div>
@@ -400,39 +400,39 @@
 
   <div class="insight-box green" style="margin-top:20px">
     <h4>改进方案核心思路</h4>
-    <b>关键原则：处理能力增强，输出接口不变</b><br><br>
+    <b>关键原则：显式分离主体，多向量输出（无监督）</b><br><br>
     <b>新增部分</b>（步骤 2, 4, 5）：检测分割 → 主体级特征 → 时空交互<br>
     <b>保留部分</b>（步骤 3, 7）：原始编码器和解码器不变<br>
-    <b>关键变化</b>（步骤 6）：多主体特征聚合回<b>单向量 z̃ ∈ R<sup>32</sup></b>，保持信息瓶颈<br><br>
+    <b>关键变化</b>（步骤 6）：Per-Object VAE → <b>多向量 (A+1)×z̃ ∈ R<sup>32</sup></b>，每个主体一个隐动作向量<br>
+    <b>训练目标</b>：仅 L<sub>recon</sub> + β·KL + λ·L<sub>obj_recon</sub>，<b>无动作监督</b><br><br>
     <span class="hl">类比</span>：原始 LAM 的 action_prompt 是"盲人摸象"——1 个 token 必须从全局 attention 中猜测哪里有运动。<br>
-    改进后：先用检测"看见"每个主体，再让它们交互，最后压缩回 1 个向量——<b>看得更清楚，但说的还是一句话</b>。
+    改进后：先用检测"看见"每个主体，再让它们交互，每个主体独立的隐动作。——<b>分工精细，输出丰富，但世界模型需要适配</b>。
   </div>
 </div>
 
 <!-- ==================== Section 3: World Model Interface ==================== -->
 <div class="diagram-container">
-  <div class="section-title worldmodel">三、与下游世界模型的衔接</div>
+  <div class="section-title worldmodel">三、多向量输出与世界模型的衔接</div>
 
   <div class="wm-flow" style="margin-bottom:20px">
-    <div class="box box-bottleneck" style="min-width:100px">
+    <div class="box box-bottleneck" style="min-width:120px">
       <div class="box-title">LAM 输出</div>
-      <div class="box-detail">z̃ ∈ R<sup>32</sup></div>
-    </div>
-    <div class="arrow-h">→</div>
-    <div class="box box-worldmodel" style="min-width:140px">
-      <div class="box-title">VideoPredictionEmbedder</div>
-      <div class="box-detail">
-        z̃ → [crossattn, vector]<br>
-        (B,1,32) + (B,32)
-      </div>
+      <div class="box-detail">(A+1) × z̃ ∈ R<sup>32</sup></div>
     </div>
     <div class="arrow-h">→</div>
     <div class="box box-worldmodel" style="min-width:180px">
+      <div class="box-title">适配策略</div>
+      <div class="box-detail" style="text-align:left">
+        <b>A. Mean Pool 聚合</b>（实验性）：z̃ = mean(z̃<sub>0</sub>, ..., z̃<sub>A</sub>)  → R<sup>32</sup><br>
+        <b>B. 多条件注入</b>（待实现）：每个主体 crossattn + vector 分通道注入<br>
+        <b>C. 主体选择</b>：只取主主体或运动最大的主体
+      </div>
+    </div>
+    <div class="arrow-h">→</div>
+    <div class="box box-worldmodel" style="min-width:130px">
       <div class="box-title">VideoUNet (SVD)</div>
       <div class="box-detail">
-        crossattn: Cross-Attention 条件<br>
-        vector: Adaptive LayerNorm 条件<br>
-        <span style="font-size:10px;color:#065f46">1.5B 参数，3D UNet</span>
+        需适配多条件注入
       </div>
     </div>
     <div class="arrow-h">→</div>
@@ -442,15 +442,11 @@
     </div>
   </div>
 
-  <div style="text-align:center; font-size:12px; color:#666; margin-bottom:16px">
-    适配阶段：ActionBook / ActionMLP 将真实动作映射到 R<sup>32</sup>，替代 LAM 输出
-  </div>
-
   <div class="insight-box blue">
     <h4>接口兼容性分析</h4>
     <b>原始 LAM</b>：z̃ ∈ R<sup>32</sup> → squeeze → (B,1,32) crossattn + (B,32) vector → ✅ 直接兼容<br>
-    <b>改进方案（单向量输出）</b>：z̃ ∈ R<sup>32</sup> → 同样 squeeze → ✅ <b>完全兼容，无需修改世界模型</b><br>
-    <b>多向量输出（已放弃）</b>：z̃ ∈ R<sup>A×32</sup> → ❌ 需要重新设计世界模型条件注入方式
+    <b>改进方案（多向量输出）</b>：(A+1)×z̃ ∈ R<sup>32</sup> → ❌ 需要设计聚合或多条件注入策略<br>
+    <b>当前实验阶段</b>：仅验证隐动作空间的结构性，暂不接入世界模型
   </div>
 </div>
 
@@ -501,32 +497,32 @@
       <tr>
         <td><b>信息瓶颈</b></td>
         <td>1 token → VAE → z̃ ∈ R<sup>32</sup></td>
-        <td>A+1 向量 → Mean Pool → VAE → z̃ ∈ R<sup>32</sup></td>
+        <td>A+1 向量 → Per-Object VAE → <b>(A+1) × z̃ ∈ R<sup>32</sup></b></td>
         <td><span class="tag-improved">改</span></td>
       </tr>
       <tr>
         <td><b>输出形状</b></td>
         <td>(B, T-1, 1, 32)</td>
-        <td>(B, T-1, 1, 32) <span style="color:#059669">← 相同！</span></td>
-        <td><span class="tag-same">不变</span></td>
+        <td>(B, T-1, A+1, 32) <span style="color:#c2410c">← 多向量</span></td>
+        <td><span class="tag-improved">改</span></td>
       </tr>
       <tr>
         <td><b>解码器</b></td>
-        <td>Cross-Attention + SpatioTransformer</td>
-        <td>相同</td>
-        <td><span class="tag-same">不变</span></td>
+        <td>Cross-Attention + SpatioTransformer（单 slot）</td>
+        <td>Cross-Attention（A+1 slots）+ SpatioTransformer</td>
+        <td><span class="tag-improved">改</span></td>
       </tr>
       <tr>
         <td><b>损失函数</b></td>
         <td>L<sub>recon</sub> + β·KL</td>
-        <td>L<sub>recon</sub> + β·KL + λ·L<sub>obj_recon</sub>（可选）</td>
+        <td><b>L<sub>recon</sub> + β·KL + λ·L<sub>obj_recon</sub></b><br><span style="font-size:11px;color:#888">无动作监督</span></td>
         <td><span class="tag-improved">新增</span></td>
       </tr>
       <tr>
         <td><b>世界模型接口</b></td>
         <td>crossattn (B,1,32) + vector (B,32)</td>
-        <td><b>完全相同</b></td>
-        <td><span class="tag-same">不变</span></td>
+        <td><b>(A+1)×z̃ → 需适配</b><br><span style="font-size:11px;color:#888">Mean Pool / 多条件注入</span></td>
+        <td><span class="tag-improved">需改</span></td>
       </tr>
     </tbody>
   </table>
@@ -537,33 +533,36 @@
   <div class="section-title comparison">五、核心问题与当前判断</div>
 
   <div class="insight-box red" style="margin-bottom:16px">
-    <h4>问题 1：原始 LAM 的 action_prompt 是否已经足够？</h4>
-    <b>原始设计</b>：1 个 action_prompt 通过 SpatioTemporal Attention 与所有 patch 交互，理论上已经能"看到"所有主体的运动。<br>
-    <b>我们的假设</b>：多主体运动互相抵消，导致 prompt 无法区分不同主体的动作。<br>
-    <b>反证</b>：V-JEPA 2 用单向量在复杂场景成功；SpatioTemporal Attention 不会"平均掉"不同位置的运动。<br>
-    <b>当前判断</b>：<span class="hl">该假设未经验证</span>，需要先做实验确认原始 LAM 在多主体场景下是否真的失败。
+    <h4>问题 1：改进方案的有效性</h4>
+    <b>实验结论</b>：多向量无监督 v2（recon + KL + obj_recon）训练后：<br>
+    ARI(动作聚类) = 0.0003（≈ 随机），线性探针 = 44.1%（略高于随机基线 20%）<br>
+    隐方差 = 20.5（解决了后验坍缩），但隐空间未对齐到离散动作类别<br>
+    <b>当前判断</b>：<span class="hl">改进方案在无监督下未产生结构化的隐动作空间</span>
   </div>
 
   <div class="insight-box red" style="margin-bottom:16px">
-    <h4>问题 2：改进方案是否真的比原始方案好？</h4>
-    <b>理论优势</b>：显式分离主体 → 每个主体的特征更精确 → 交互后聚合 → 隐动作更准确<br>
-    <b>理论风险</b>：检测误差传播、主体数量不确定、聚合丢失信息<br>
-    <b>当前实验</b>：无监督训练 ARI=0.03，说明即使给了 GT mask，场景级重建损失也不驱动分离<br>
-    <b>当前判断</b>：<span class="hl">改进的有效性未证明</span>，需要新的损失函数（如对象级重建）或新的评估方式
+    <h4>问题 2：为什么重建任务不足以驱动动作分离？</h4>
+    <b>原因分析</b>：重建任务只需要隐向量编码"帧间特征变化"（连续运动信号），<br>
+    不要求编码"上/下/左/右"这类离散语义类别。<br>
+    每个主体的隐向量可能编码了精细的像素级偏移量，但对线性分类器来说这些偏移量并不聚集为 5 类。<br>
+    <b>总结</b>：<span class="hl">重建驱动的隐动作是连续空间，不是离散聚类空间</span>
   </div>
 
   <div class="insight-box green" style="margin-bottom:16px">
-    <h4>问题 3：如果改进有效，如何与 AdaWorld 衔接？</h4>
-    <b>好消息</b>：改进方案输出 z̃ ∈ R<sup>32</sup>，与原始 LAM 完全兼容，<span class="hl">无需修改世界模型</span>。<br>
-    <b>衔接方式</b>：直接替换 VideoPredictionEmbedderWithLAMEncoder 中的 LAM 即可。<br>
-    <b>适配阶段</b>：ActionBook/ActionMLP 的接口也不变，因为隐动作维度仍然是 32。
+    <h4>问题 3：多向量输出与 AdaWorld 的衔接</h4>
+    <b>当前状态</b>：多向量输出 (A+1)×32 无法直接接入原始世界模型的 crossattn(B,1,32)+vector(B,32) 接口。<br>
+    <b>可行方案</b>：（A）Mean Pool 聚合回单向量 → 兼容但可能丢失信息；<br>
+    （B）重新设计世界模型的多条件注入 → 工作量较大；<br>
+    （C）只取运动最大主体的隐向量 → 简单但浪费信息。<br>
+    <b>当前阶段</b>：<span class="hl">先验证无监督隐动作空间的结构性，再考虑世界模型适配</span>
   </div>
 
   <div class="insight-box blue">
     <h4>下一步建议</h4>
-    <b>Step 1</b>：先用原始 LAM 在合成数据上训练，评估多主体场景下的隐动作质量（线性探针、聚类）<br>
-    <b>Step 2</b>：如果原始 LAM 确实失败，再验证改进方案是否更好<br>
-    <b>Step 3</b>：如果改进方案有效，直接替换 LAM，世界模型无需任何修改
+    <b>方向 1</b>：增加 obj_recon_weight 或调整 KL beta，探索是否能改善隐空间结构<br>
+    <b>方向 2</b>：尝试更大 KL beta（如 β=0.001），更紧的信息瓶颈可能迫使隐向量编码更抽象的信息<br>
+    <b>方向 3</b>：回到原始 LAM 的单向量模式，先用合成数据验证多主体场景是否真的有问题<br>
+    <b>方向 4</b>：考虑 InfoNCE / 对比学习等替代损失函数，直接鼓励同动作隐向量靠近
   </div>
 </div>
 

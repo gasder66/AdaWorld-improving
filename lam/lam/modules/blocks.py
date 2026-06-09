@@ -687,3 +687,30 @@ class ObjectSpatioTemporalAttention(nn.Module):
         # 重排回 (B, T, A+1, D)
         out = out.reshape(B, T, A1, D)
         return out
+
+
+class ObjectReconHead(nn.Module):
+    """
+    对象级重建头。
+
+    从当前帧的隐动作预测下一帧的特征（特征空间的前向预测）。
+    提供无监督的对象级学习信号，有效缓解后验坍缩。
+
+    Input:
+        z: (B, T, A, latent_dim) — A 个主体的隐动作（编码了当前帧特征）
+
+    Output:
+        next_feat_pred: (B, T, A, model_dim) — 预测的每主体下一帧特征
+    """
+
+    def __init__(self, latent_dim: int, model_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, model_dim),
+        )
+
+    def forward(self, z: Tensor) -> Tensor:
+        return self.net(z)

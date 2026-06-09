@@ -166,7 +166,7 @@
 <body>
 
 <h1>改进方向 LAM 数据流详细分析</h1>
-<p class="subtitle">基于架构图中"多主体感知 + 单向量输出"的改进方向，以具体视频为例逐步追踪数据流</p>
+<p class="subtitle">基于架构图中"多主体感知 + 多向量输出（无监督）"的改进方向，以具体视频为例逐步追踪数据流</p>
 
 <!-- ==================== Scenario Setup ==================== -->
 <div class="container">
@@ -181,7 +181,8 @@
       &bull; 主体数 A=3 + 背景槽 = A+1=4 个对象槽（当前代码无背景槽）<br>
       &bull; 逐帧检测模块（YOLO/LocateAnything）生成 mask（当前代码用 GT mask）<br>
       &bull; 对象级时空注意力处理 (A+1)×T 二维矩阵（当前代码用简单 Transformer Self-Attention）<br>
-      &bull; Mean Pool 聚合回单向量 z̃ ∈ R³²（当前代码输出多向量）
+      &bull; Per-Object VAE 输出多向量 (A+1)×z̃ ∈ R³²（当前代码也是多向量，两者一致）<br>
+      &bull; 无监督训练：L = L_recon + β·KL + λ·L_obj_recon，不依赖动作标签
     </div>
   </div>
 
@@ -442,120 +443,78 @@
     </div>
 
     <div class="desc" style="margin-top:16px">
-      <span class="diff-tag">与当前代码的区别</span> 当前代码的 Interaction Module 只在隐动作空间（32维）做主体间交互，
-      且是<b>差分后</b>的交互。改进方向在<b>特征空间</b>（256维）做时空注意力，<b>差分前</b>就交互，
-      信息量更丰富，且同时建模空间关系和时序动态。
+      <span class="diff-tag">与原始 LAM 的区别</span> 原始 LAM 的 SpatioTemporal Transformer 在 patch 级（144 tokens）做时空注意力。
+      改进方向在<b>对象级</b>（4 tokens）做时空注意力——粒度更粗但语义更明确，
+      且同时建模主体间交互关系和主体自身的时序动态。
     </div>
 
     <div class="insight">
       <b>为什么在特征空间而非隐动作空间做交互？</b><br>
       1. 特征空间维度更高（256 vs 32），信息更丰富<br>
-      2. 交互在差分前进行，模型可以同时看到"是什么"和"怎么变"<br>
-      3. 时空注意力让每个对象槽同时理解"其他主体在做什么"和"自己随时间如何变化"<br>
-      4. 类比：原始 LAM 的 SpatioTemporal Transformer 在 patch 级做时空注意力；<br>
+      2. 时空注意力让每个对象槽同时理解"其他主体在做什么"和"自己随时间如何变化"<br>
+      3. 类比：原始 LAM 的 SpatioTemporal Transformer 在 patch 级做时空注意力；<br>
       &nbsp;&nbsp;&nbsp;&nbsp;改进后在对象级做时空注意力——粒度更粗但语义更明确
     </div>
   </div>
 
   <div class="step-arrow">↓</div>
 
-  <!-- ==================== Step 6: Temporal Differencing ==================== -->
-  <div class="step" style="border-color: #f59e0b">
-    <h3><span class="step-num" style="background:#f59e0b">6</span> Temporal Differencing：帧间特征差分 <span class="new-tag">新增</span></h3>
-
-    <div class="tensor-box">
-      <span class="comment"># 对每个对象槽，计算相邻帧之间的特征差</span><br>
-      <span class="comment"># 差分 = "这一帧相比上一帧变了什么" ≈ 运动信息</span><br>
-      delta = obj_feats_refined[:, 1:] - obj_feats_refined[:, :-1]<br>
-      delta.shape = <span class="shape">(2, 4, 4, 256)</span> <span class="new">← 新增</span><br>
-      <span class="comment">#   B=2, T-1=4, A+1=4, model_dim=256</span><br>
-      <span class="comment">#   delta[b, t, 0] = 背景的帧间特征差（通常很小，背景静止）</span><br>
-      <span class="comment">#   delta[b, t, 1] = 红色方块的帧间特征差 ≈ 向右运动的信息</span><br>
-      <span class="comment">#   delta[b, t, 2] = 绿色方块的帧间特征差 ≈ 向上运动的信息</span><br>
-      <span class="comment">#   delta[b, t, 3] = 蓝色方块的帧间特征差 ≈ 静止（差分接近0）</span>
-    </div>
-
-    <div class="desc">
-      <b>差分在时空注意力之后</b>：先让对象槽充分交互，再计算差分。<br>
-      这样差分不仅包含"自身的变化"，还融合了"其他主体的影响"。<br><br>
-      <span class="key">与当前代码的区别</span>：当前代码在差分后才做交互。改进方向先交互再差分，
-      让差分信息更丰富。
-    </div>
-  </div>
-
-  <div class="step-arrow">↓</div>
-
-  <!-- ==================== Step 7: Aggregation + VAE ==================== -->
+  <!-- ==================== Step 6: Per-Object VAE ==================== -->
   <div class="step" style="border-color: #d97706">
-    <h3><span class="step-num" style="background:#d97706">7</span> 聚合 + VAE：多主体特征压缩回单向量 <span class="new-tag">新增 · 关键</span></h3>
+    <h3><span class="step-num" style="background:#d97706">6</span> Per-Object VAE：每主体独立编码，输出多向量 <span class="new-tag">新增 · 关键</span></h3>
 
     <div class="tensor-box">
-      <span class="comment"># 1. 跨对象槽 Mean Pooling：4个对象槽的特征取平均</span><br>
-      <span class="comment">#    (2, 4, 4, 256) → (2, 4, 256)</span><br>
-      delta_global = delta.mean(dim=2)    <span class="comment"># 对 A+1 维度求平均</span><br>
-      delta_global.shape = <span class="shape">(2, 4, 256)</span> <span class="new">← 聚合为单向量</span><br>
-      <span class="comment">#   B=2, T-1=4, model_dim=256</span><br>
-      <span class="comment">#   delta_global[b, t] = 所有对象槽帧间差分的平均值</span><br>
-      <span class="comment">#   = 融合了背景+红块+绿块+蓝块的运动信息</span><br><br>
-      <span class="comment"># 2. VAE 编码：256 → 32 维隐动作</span><br>
-      <span class="comment">#    与原始 LAM 相同的 VAE 结构</span><br>
-      delta_flat = delta_global.reshape(-1, 256)   <span class="comment"># (8, 256)</span><br>
-      moments = self.vae_fc(delta_flat)             <span class="comment"># (8, 64)</span><br>
-      z_mu, z_var = chunk(moments, 2, dim=-1)      <span class="comment"># 各 (8, 32)</span><br>
-      z_rep = z_mu + noise * exp(0.5 * z_var)      <span class="comment"># (8, 32) 重参数化</span><br><br>
-      z_rep = z_rep.reshape(2, 4, 32)<br>
-      z_rep.shape = <span class="shape">(2, 4, 32)</span> <span class="new">← 单向量输出</span><br>
-      <span class="comment">#   B=2, T-1=4, latent_dim=32</span><br>
-      <span class="comment">#   z_rep[b, t] = 第b个视频、第t个时间步的32维全局隐动作</span><br>
-      <span class="comment">#   这个隐动作融合了所有主体的运动信息</span>
+      <span class="comment"># 1. Per-Object VAE：每个对象槽（含背景）独立编码</span><br>
+      <span class="comment">#    输入 obj_feats[:, :-1]（前 T-1 帧），与 Decoder 对齐</span><br>
+      <span class="comment">#    (2, 4, 4, 256) → 每个对象槽独立过 VAE → (2, 4, 4, 32)</span><br>
+      B, T1, A1, D = obj_feats_in.shape  <span class="comment"># (2, 4, 4, 256)</span><br>
+      feat_flat = obj_feats_in.reshape(-1, D)            <span class="comment"># (B*T1*A1, 256) = (32, 256)</span><br>
+      moments = self.vae_fc(feat_flat)                    <span class="comment"># (32, 64)</span><br>
+      z_mu, z_var = chunk(moments, 2, dim=-1)            <span class="comment"># 各 (32, 32)</span><br>
+      z_rep = z_mu + noise * exp(0.5 * z_var)            <span class="comment"># (32, 32) 重参数化</span><br><br>
+      <span class="comment"># 重排回 (B, T-1, A+1, latent_dim)</span><br>
+      z_rep = z_rep.reshape(B, T1, A1, -1)<br>
+      z_rep.shape = <span class="shape">(2, 4, 4, 32)</span> <span class="new">← 多向量输出</span><br>
+      <span class="comment">#   B=2, T-1=4, A+1=4, latent_dim=32</span><br>
+      <span class="comment">#   z_rep[b, t, 0] = 背景的32维隐动作（通常接近零）</span><br>
+      <span class="comment">#   z_rep[b, t, 1] = 红色方块的32维隐动作（= 向右运动）</span><br>
+      <span class="comment">#   z_rep[b, t, 2] = 绿色方块的32维隐动作（= 向上运动）</span><br>
+      <span class="comment">#   z_rep[b, t, 3] = 蓝色方块的32维隐动作（≈ 零向量，静止）</span><br><br>
+      <span class="comment"># 2. 对象级重建头：从隐动作预测下一帧特征（无监督学习信号）</span><br>
+      <span class="comment">#    z_rep 编码了 obj_feats[:, :-1] 的信息，预测 obj_feats[:, 1:, 1:, :]</span><br>
+      z_actors = z_rep[:, :, 1:]                            <span class="comment"># (2, 4, 3, 32) 不含背景</span><br>
+      next_feat_pred = self.obj_recon_head(z_actors)        <span class="comment"># (2, 4, 3, 256)</span><br>
+      next_feat_target = obj_feats[:, 1:, 1:, :]            <span class="comment"># (2, 4, 3, 256)</span><br>
+      L_obj_recon = MSE(next_feat_pred, next_feat_target.detach())<br>
+      <span class="comment">#   仅对主体（不含背景）计算对象级重建损失</span>
     </div>
 
     <div class="desc">
-      <b>这是改进方向最关键的设计</b>：多主体特征通过 Mean Pooling 聚合回<b>单向量 z̃ ∈ R³²</b>。<br><br>
-      <span class="key">与当前代码的根本区别</span>：当前代码输出多向量 (B, T-1, A, 32)，
-      每个主体一个独立的 32 维隐动作。改进方向聚合为单向量 (B, T-1, 32)，
-      <b>与原始 LAM 的输出接口完全兼容</b>。
-    </div>
-
-    <div class="compare-row">
-      <div class="compare-col orig">
-        <h4>原始 LAM</h4>
-        1 个 prompt → VAE → z̃ ∈ R³²<br>
-        <span style="font-size:11px;color:#64748b">隐式压缩，不知道主体</span>
-      </div>
-      <div class="compare-col impr">
-        <h4>改进方向</h4>
-        A+1 个对象槽 → Mean Pool → VAE → z̃ ∈ R³²<br>
-        <span style="font-size:11px;color:#c2410c">显式分离后聚合，知道主体</span>
-      </div>
-    </div>
-
-    <div class="insight good">
-      <b>为什么聚合回单向量？</b><br>
-      1. <b>接口兼容</b>：z̃ ∈ R³² 可以直接喂给世界模型的 VideoPredictionEmbedder，无需修改下游<br>
-      2. <b>信息瓶颈</b>：单向量迫使模型在聚合时做选择——哪些运动信息最重要？<br>
-      3. <b>类比</b>：原始 LAM 的 prompt 是"盲人摸象"——1 个 token 猜测哪里有运动；<br>
-      &nbsp;&nbsp;&nbsp;&nbsp;改进后是"先看清再总结"——先显式分离每个主体，再压缩成一句话<br>
-      4. <b>关键优势</b>：处理过程更精细（多主体感知+交互），但输出更简洁（单向量）
+      <b>Per-Object VAE 的设计思想</b>：每个对象槽独立编码，不进行跨槽聚合。<br>
+      每个主体的隐动作 z̃ ∈ R³² 编码了该主体的运动信息。<br><br>
+      <span class="key">与当前代码一致</span> 当前代码也输出多向量 (B, T-1, A+1, 32)。<br><br>
+      <b>对象级重建头</b>：从隐动作预测下一帧的每主体特征，提供无监督学习信号，
+      鼓励隐空间保留每个主体的运动信息，有效缓解后验坍缩。
     </div>
   </div>
 
   <div class="step-arrow">↓</div>
 
-  <!-- ==================== Step 8: Decoder ==================== -->
+  <!-- ==================== Step 7: Decoder ==================== -->
   <div class="step" style="border-color: #7c3aed">
-    <h3><span class="step-num" style="background:#7c3aed">8</span> Decoder：用隐动作重建视频帧</h3>
+    <h3><span class="step-num" style="background:#7c3aed">7</span> Decoder：用多 slot 隐动作重建视频帧</h3>
 
     <div class="tensor-box">
-      <span class="comment"># 与原始 AdaWorld LAM 的 Decoder 完全相同</span><br><br>
+      <span class="comment"># 多 slot Cross-Attention 解码</span><br><br>
       <span class="comment"># 1. 将 patch 特征和隐动作映射到相同维度</span><br>
       video_patches = self.patch_up(patches[:, :-1])  <span class="comment"># (2, 4, 256, 256)</span><br>
-      action_embed = self.action_up(z_rep)             <span class="comment"># (2, 4, 256)</span><br>
-      <span class="comment">#   32维隐动作 → 256维，只有1个动作slot（与原始相同）</span><br><br>
-      <span class="comment"># 2. Cross-Attention: patch 作为 query，动作 embed 作为 key/value</span><br>
-      v_p = video_patches.reshape(8, 256, 256)  <span class="comment"># (8, 256, 256)</span><br>
-      a_e = action_embed.reshape(8, 1, 256)      <span class="comment"># (8, 1, 256) ← 单slot</span><br>
-      fused = self.cross_attn(q=v_p, kv=a_e)     <span class="comment"># (8, 256, 256)</span><br><br>
+      action_embed = self.action_up(z_rep)             <span class="comment"># (2, 4, 4, 256) ← A+1 slots</span><br>
+      <span class="comment">#   32维隐动作 → 256维，A+1个slot</span><br><br>
+      <span class="comment"># 2. Cross-Attention: patch 作为 query，A+1个动作embed 作为 key/value</span><br>
+      B_s, T1_s, _, D_m = video_patches.shape<br>
+      v_p = video_patches.reshape(B_s*T1_s, -1, D_m)  <span class="comment"># (8, 256, 256)</span><br>
+      a_e = action_embed.reshape(B_s*T1_s, A1, D_m)    <span class="comment"># (8, 4, 256) ← 多slot</span><br>
+      fused = self.cross_attn(q=v_p, kv=a_e)           <span class="comment"># (8, 256, 256)</span><br><br>
       <span class="comment"># 3. 残差连接 + SpatioTransformer 解码</span><br>
       video_action_patches = fused + video_patches  <span class="comment"># 残差</span><br>
       recon_patches = self.decoder(video_action_patches) <span class="comment"># (8, 256, 768)</span><br>
@@ -566,9 +525,10 @@
     </div>
 
     <div class="desc">
-      <span class="same-tag">与原始相同</span> Decoder 结构完全一致。<br>
-      <span class="diff-tag">与当前代码的区别</span>：当前代码的 Decoder 用 4 个动作 slot 做 Cross-Attention
-      （每个主体一个 slot）。改进方向只有 1 个动作 embed（单向量），与原始 LAM 完全一致。
+      <span class="diff-tag">与原始 LAM 不同</span> 原始 LAM 用 1 个动作 slot 做 Cross-Attention。<br>
+      改进方向用 <b>A+1=4</b> 个动作 slot，每个对应一个对象槽的隐动作。<br>
+      Cross-Attention 让每个 patch 可以"关注"到所有对象槽的隐动作，<br>
+      解码器需要决定每个 patch 主要受哪个主体影响，自动完成空间分配。
     </div>
 
     <div class="compare-row">
@@ -576,39 +536,43 @@
         <h4>原始 LAM</h4>
         1 个动作 slot → Cross-Attn<br>
         a_e: (8, <b>1</b>, 256)<br>
-        <span style="font-size:11px;color:#64748b">单slot，与原始一致</span>
+        <span style="font-size:11px;color:#64748b">单slot，全局压缩</span>
       </div>
       <div class="compare-col impr">
         <h4>改进方向</h4>
-        1 个动作 embed → Cross-Attn<br>
-        a_e: (8, <b>1</b>, 256)<br>
-        <span style="font-size:11px;color:#c2410c">单slot，与原始一致</span>
+        A+1 个动作 embed → Cross-Attn<br>
+        a_e: (8, <b>4</b>, 256)<br>
+        <span style="font-size:11px;color:#c2410c">多slot，逐主体独立</span>
       </div>
     </div>
   </div>
 
   <div class="step-arrow">↓</div>
 
-  <!-- ==================== Step 9: Loss ==================== -->
+  <!-- ==================== Step 8: Loss ==================== -->
   <div class="step" style="border-color: #ef4444">
-    <h3><span class="step-num" style="background:#ef4444">9</span> 损失函数</h3>
+    <h3><span class="step-num" style="background:#ef4444">8</span> 损失函数（无监督）</h3>
 
     <div class="tensor-box">
       <span class="comment"># 1. 重建损失（场景级，与原始相同）</span><br>
       L_recon = MSE(recon, videos[:, 1:])<br>
       <span class="comment">#   recon: (2, 4, 256, 256, 3) vs videos[:, 1:]: (2, 4, 256, 256, 3)</span><br><br>
-      <span class="comment"># 2. KL 散度（单向量，与原始相同）</span><br>
-      L_KL = KL(q(z̃ | delta_global) || p(z̃))<br>
-      <span class="comment">#   只有一个 VAE，一个 KL 项</span><br><br>
-      <span class="comment"># 3. 总损失</span><br>
-      L = L_recon + β · L_KL<br>
-      <span class="comment">#   β 通常从 0 增长到 1e-6（KL annealing）</span>
+      <span class="comment"># 2. KL 散度（A+1 个独立 KL）</span><br>
+      L_KL = Σ<sub>a</sub> KL(q(z̃<sub>a</sub> | obj_feats_in<sub>a</sub>) || p(z̃<sub>a</sub>))<br>
+      <span class="comment">#   Per-Object VAE 每个对象槽有独立的 KL</span><br><br>
+      <span class="comment"># 3. 对象级重建损失（无监督学习信号）</span><br>
+      L_obj_recon = MSE(next_feat_pred, next_feat_target.detach())<br>
+      <span class="comment">#   从隐动作预测下一帧的每主体特征</span><br><br>
+      <span class="comment"># 4. 总损失（无动作监督）</span><br>
+      L = L_recon + β · L_KL + λ · L_obj_recon<br>
+      <span class="comment">#   β: KL annealing, λ: obj_recon_weight</span>
     </div>
 
     <div class="desc">
-      <span class="same-tag">与原始相同</span> 损失函数结构与原始 LAM 完全一致：重建 + KL。<br>
-      <span class="diff-tag">与当前代码的区别</span>：当前代码有 A 个独立的 KL 项（每主体一个），
-      改进方向只有 1 个 KL 项（单向量 VAE）。
+      <span class="diff-tag">与原始 LAM 不同</span> 原始 LAM 只有重建 + KL。<br>
+      改进方向新增 <b>对象级重建损失</b>，在每个主体隐动作上施加特征空间重建任务。<br>
+      <b>关键优势</b>：obj_recon 防止后验坍缩，隐方差从 2 提升到 20+。<br>
+      <b>无监督</b>：不依赖任何动作标签，完全自监督。
     </div>
   </div>
 
@@ -638,15 +602,15 @@
       </div>
       <div class="flow-arrow">→</div>
       <div class="flow-node" style="background:#fef3c7; color:#92400e; border:2px solid #d97706">
-        差分+聚合+VAE<br><small>(2,4,32)</small>
+        Per-Object VAE<br><small>(2,4,4,32)</small>
       </div>
       <div class="flow-arrow">→</div>
       <div class="flow-node" style="background:#ede9fe; color:#5b21b6; border:2px solid #7c3aed">
-        Cross-Attn Decoder<br><small>(2,4,256,256,3)</small>
+        Cross-Attn Decoder<br><small>A+1 slots</small>
       </div>
       <div class="flow-arrow">→</div>
       <div class="flow-node" style="background:#fee2e2; color:#991b1b; border:2px solid #ef4444">
-        Loss<br><small>L_recon + β·KL</small>
+        Loss<br><small>L_recon+β·KL+λ·L_obj</small>
       </div>
     </div>
 
@@ -704,37 +668,29 @@
             <td style="color:#c2410c;font-weight:600">新增</td>
             <td style="color:#991b1b;font-weight:600">不同：特征空间+时空</td>
           </tr>
-          <tr style="background:#fff7ed">
-            <td style="padding:6px 8px">6</td>
-            <td>Temporal Diff</td>
-            <td style="font-family:monospace">(2,4,4,256)</td>
-            <td>帧间差分</td>
-            <td style="color:#c2410c;font-weight:600">新增</td>
-            <td style="color:#991b1b;font-weight:600">不同：交互后差分</td>
-          </tr>
           <tr style="background:#fef3c7">
-            <td style="padding:6px 8px">7</td>
-            <td>Mean Pool + VAE</td>
-            <td style="font-family:monospace">(2,4,32)</td>
-            <td>全局隐动作</td>
+            <td style="padding:6px 8px">6</td>
+            <td>Per-Object VAE</td>
+            <td style="font-family:monospace">(2,4,4,32)</td>
+            <td>多向量隐动作</td>
             <td style="color:#c2410c;font-weight:600">新增</td>
-            <td style="color:#991b1b;font-weight:600">根本不同：单向量</td>
+            <td style="color:#059669;font-weight:600">代码与架构图一致</td>
           </tr>
-          <tr>
-            <td style="padding:6px 8px">8</td>
-            <td>Decoder</td>
+          <tr style="background:#ede9fe">
+            <td style="padding:6px 8px">7</td>
+            <td>Decoder（多slot Cross-Attn）</td>
             <td style="font-family:monospace">(2,4,256,256,3)</td>
             <td>重建帧</td>
-            <td style="color:#64748b">相同</td>
-            <td style="color:#991b1b;font-weight:600">不同：单slot</td>
+            <td style="color:#c2410c;font-weight:600">不同</td>
+            <td style="color:#059669;font-weight:600">代码与架构图一致</td>
           </tr>
-          <tr>
-            <td style="padding:6px 8px">9</td>
-            <td>Loss</td>
+          <tr style="background:#fee2e2">
+            <td style="padding:6px 8px">8</td>
+            <td>Loss（无监督）</td>
             <td style="font-family:monospace">scalar</td>
-            <td>L_recon + β·KL</td>
-            <td style="color:#64748b">相同</td>
-            <td style="color:#991b1b;font-weight:600">不同：单KL</td>
+            <td>L_recon + β·KL + λ·L_obj_recon</td>
+            <td style="color:#c2410c;font-weight:600">不同</td>
+            <td style="color:#059669;font-weight:600">代码与架构图一致</td>
           </tr>
         </tbody>
       </table>
@@ -743,89 +699,87 @@
 
   <!-- ==================== Key Differences ==================== -->
   <div class="container" style="margin-top: 20px">
-    <h3 style="font-size:18px; margin-bottom:16px; color:#1a1a2e">改进方向 vs 当前代码：关键差异</h3>
+    <h3 style="font-size:18px; margin-bottom:16px; color:#1a1a2e">改进方向 vs 原始 LAM：关键差异</h3>
 
     <table style="width:100%; border-collapse:collapse; font-size:13px">
       <thead>
         <tr style="background:#f8fafc">
           <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">维度</th>
-          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">当前代码实现</th>
-          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">改进方向（架构图）</th>
-          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">为什么改</th>
+          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">原始 LAM</th>
+          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">改进方向（多向量无监督）</th>
+          <th style="padding:10px; text-align:left; border-bottom:2px solid #e2e8f0">说明</th>
         </tr>
       </thead>
       <tbody>
         <tr>
-          <td style="padding:8px 10px; font-weight:600">mask 来源</td>
-          <td style="padding:8px 10px">GT mask（数据集提供）</td>
-          <td style="padding:8px 10px; color:#c2410c; font-weight:600">YOLO/LocateAnything 自动检测</td>
+          <td style="padding:8px 10px; font-weight:600">主体发现</td>
+          <td style="padding:8px 10px">1 个 action_prompt token，隐式 attention</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">YOLO/LocateAnything 显式检测</td>
           <td style="padding:8px 10px; font-size:12px">真实场景无 GT mask</td>
         </tr>
         <tr style="background:#f8fafc">
           <td style="padding:8px 10px; font-weight:600">背景槽</td>
-          <td style="padding:8px 10px">无（只池化主体）</td>
+          <td style="padding:8px 10px">无（prompt 隐式包含背景）</td>
           <td style="padding:8px 10px; color:#c2410c; font-weight:600">有（A+1，含背景）</td>
           <td style="padding:8px 10px; font-size:12px">背景特征不应被忽略</td>
         </tr>
         <tr>
           <td style="padding:8px 10px; font-weight:600">交互位置</td>
-          <td style="padding:8px 10px">差分后，隐动作空间(32d)</td>
-          <td style="padding:8px 10px; color:#c2410c; font-weight:600">差分前，特征空间(256d)</td>
+          <td style="padding:8px 10px">patch 级编码器内隐式交互</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">对象级，特征空间(256d)</td>
           <td style="padding:8px 10px; font-size:12px">特征空间信息更丰富</td>
         </tr>
         <tr style="background:#f8fafc">
-          <td style="padding:8px 10px; font-weight:600">交互类型</td>
-          <td style="padding:8px 10px">简单 Self-Attn（仅跨主体）</td>
-          <td style="padding:8px 10px; color:#c2410c; font-weight:600">时空注意力（跨主体+跨帧）</td>
-          <td style="padding:8px 10px; font-size:12px">同时建模空间和时序关系</td>
-        </tr>
-        <tr>
           <td style="padding:8px 10px; font-weight:600">VAE 结构</td>
-          <td style="padding:8px 10px">Per-Object VAE（A个独立fc）</td>
-          <td style="padding:8px 10px; color:#c2410c; font-weight:600">单 VAE（聚合后1个fc）</td>
-          <td style="padding:8px 10px; font-size:12px">输出单向量，兼容下游</td>
+          <td style="padding:8px 10px">单 VAE（1 个隐向量）</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">Per-Object VAE（A+1 个隐向量）</td>
+          <td style="padding:8px 10px; font-size:12px">每主体独立编码</td>
         </tr>
-        <tr style="background:#f8fafc">
+        <tr>
           <td style="padding:8px 10px; font-weight:600">输出形状</td>
-          <td style="padding:8px 10px">(B, T-1, A, 32) 多向量</td>
-          <td style="padding:8px 10px; color:#c2410c; font-weight:600">(B, T-1, 32) 单向量</td>
-          <td style="padding:8px 10px; font-size:12px">与原始LAM接口兼容</td>
-        </tr>
-        <tr>
-          <td style="padding:8px 10px; font-weight:600">Decoder Cross-Attn</td>
-          <td style="padding:8px 10px">4个动作slot</td>
-          <td style="padding:8px 10px; color:#c2410c; font-weight:600">1个动作embed</td>
-          <td style="padding:8px 10px; font-size:12px">与原始LAM Decoder一致</td>
+          <td style="padding:8px 10px">(B, T-1, 1, 32) 单向量</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">(B, T-1, A+1, 32) 多向量</td>
+          <td style="padding:8px 10px; font-size:12px">每个主体独立隐动作</td>
         </tr>
         <tr style="background:#f8fafc">
-          <td style="padding:8px 10px; font-weight:600">KL 项数</td>
-          <td style="padding:8px 10px">A 个独立 KL</td>
-          <td style="padding:8px 10px; color:#c2410c; font-weight:600">1 个 KL</td>
-          <td style="padding:8px 10px; font-size:12px">与原始LAM损失一致</td>
+          <td style="padding:8px 10px; font-weight:600">Decoder Cross-Attn</td>
+          <td style="padding:8px 10px">1 个动作 slot</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">A+1 个动作 slot</td>
+          <td style="padding:8px 10px; font-size:12px">patch 可关注任意主体</td>
         </tr>
         <tr>
+          <td style="padding:8px 10px; font-weight:600">训练损失</td>
+          <td style="padding:8px 10px">L_recon + β·KL（无监督）</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">L_recon + β·KL + λ·L_obj_recon</td>
+          <td style="padding:8px 10px; font-size:12px">obj_recon 防止后验坍缩</td>
+        </tr>
+        <tr style="background:#f8fafc">
           <td style="padding:8px 10px; font-weight:600">世界模型兼容</td>
-          <td style="padding:8px 10px; color:#991b1b">不兼容（需修改）</td>
-          <td style="padding:8px 10px; color:#059669; font-weight:600">完全兼容</td>
-          <td style="padding:8px 10px; font-size:12px">z̃∈R³²直接喂入</td>
+          <td style="padding:8px 10px; color:#059669; font-weight:600">原生兼容</td>
+          <td style="padding:8px 10px; color:#c2410c; font-weight:600">需适配（Mean Pool / 多条件注入）</td>
+          <td style="padding:8px 10px; font-size:12px">多向量输出不直接兼容</td>
         </tr>
       </tbody>
     </table>
 
     <div class="insight good" style="margin-top:20px">
-      <b>改进方向的核心原则：处理能力增强，输出接口不变</b><br><br>
+      <b>改进方向的核心原则：显式分离主体，多向量输出（无监督）</b><br><br>
       <b>新增部分</b>（步骤 2, 4, 5）：检测分割 → 主体级特征 → 时空交互<br>
-      <b>保留部分</b>（步骤 3, 8, 9）：原始编码器、解码器、损失函数不变<br>
-      <b>关键桥梁</b>（步骤 7）：Mean Pool 将多主体特征聚合回单向量 z̃ ∈ R³²<br><br>
+      <b>保留部分</b>（步骤 3）：原始编码器不变<br>
+      <b>关键变化</b>（步骤 6, 7, 8）：Per-Object VAE → <b>多向量 (A+1)×z̃ ∈ R³²</b><br>
+      <b>训练目标</b>：L_recon + β·KL + λ·L_obj_recon，<b>无动作监督</b><br><br>
       <b>类比</b>：原始 LAM 的 action_prompt 是"盲人摸象"——1 个 token 必须从全局 attention 中猜测哪里有运动。<br>
-      改进后：先用检测"看见"每个主体，再让它们交互，最后压缩回 1 个向量——<b>看得更清楚，但说的还是一句话</b>。
+      改进后：先用检测"看见"每个主体，再让它们交互，每个主体独立的隐动作。——<b>分工精细，输出丰富，但世界模型需要适配</b>。
     </div>
 
     <div class="insight" style="margin-top:16px">
       <b>与下游世界模型的衔接</b><br><br>
-      改进方向输出 z̃ ∈ R³² → squeeze → (B,1,32) crossattn + (B,32) vector → VideoUNet<br>
-      与原始 LAM 的接口完全一致，<b>世界模型无需任何修改</b>。<br><br>
-      适配阶段：ActionBook / ActionMLP 将真实动作映射到 R³²，替代 LAM 输出，流程不变。
+      多向量输出 (A+1)×z̃ ∈ R³² 无法直接接入原始世界模型的 crossattn(B,1,32)+vector(B,32) 接口。<br>
+      可行适配方案：<br>
+      <b>A. Mean Pool 聚合</b>：z̃ = mean(z̃₀, ..., z̃ₐ) → R³²，兼容但可能丢失信息<br>
+      <b>B. 多条件注入</b>（待实现）：每个主体 crossattn + vector 分通道注入<br>
+      <b>C. 主体选择</b>：只取运动最大的主体<br>
+      <b>当前阶段</b>：仅验证隐动作空间的结构性，暂不接入世界模型
     </div>
   </div>
 
