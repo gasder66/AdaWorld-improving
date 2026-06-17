@@ -7,6 +7,8 @@
 /lam/umap/
 /data/synthetic_multi_actor/
 /lam/results/
+/result/
+/pretrained/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -57,7 +57,7 @@ def main():
     torch.cuda.empty_cache()
 
     RESULTS_DIR = os.path.join(
-        os.path.dirname(__file__), "..", "results", "v3_obj_st_attention"
+        os.path.dirname(__file__), "..", "..", "result", "v3_obj_st_attention"
     )
     os.makedirs(RESULTS_DIR, exist_ok=True)
 

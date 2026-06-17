@@ -1,5 +1,5 @@
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -62,20 +62,24 @@ class SelfAttention(nn.Module):
             query: Tensor,
             key: Tensor,
             value: Tensor,
-            is_causal: bool = False
+            is_causal: bool = False,
+            key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         L, S = query.shape[-2], key.shape[-2]
         attn_bias = torch.zeros(L, S, dtype=query.dtype).to(query)
         if is_causal:
             temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0).to(attn_bias)
             attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, S), True = mask out this key
+            attn_bias = attn_bias.unsqueeze(0) + key_padding_mask.unsqueeze(1).unsqueeze(2).to(attn_bias.dtype) * float("-inf")
 
         attn_weight = query @ key.transpose(-2, -1) * self.scale
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
         return attn_weight @ value
 
-    def forward(self, x: Tensor, is_causal: bool = False) -> Tensor:
+    def forward(self, x: Tensor, is_causal: bool = False, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
@@ -84,7 +88,7 @@ class SelfAttention(nn.Module):
             q = self.rotary_embedding.rotate_queries_or_keys(q, self.rotary_embedding.freqs)
             k = self.rotary_embedding.rotate_queries_or_keys(k, self.rotary_embedding.freqs)
             q, k = map(lambda t: t.contiguous(), (q, k))
-        out = self.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        out = self.scaled_dot_product_attention(q, k, v, is_causal=is_causal, key_padding_mask=key_padding_mask)
         del q, k, v
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out)
@@ -104,13 +108,17 @@ class SpatioBlock(nn.Module):
         self.norm1 = nn.LayerNorm(model_dim)
         self.norm2 = nn.LayerNorm(model_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         t_len = x.shape[1]
 
         # Spatial attention
         x = rearrange(x, "b t s e -> (b t) s e")
         x_ = self.norm1(x)
-        x_ = self.spatial_attn(x_)
+        if key_padding_mask is not None:
+            mask = rearrange(key_padding_mask, "b t s -> (b t) s")
+            x_ = self.spatial_attn(x_, key_padding_mask=~mask)
+        else:
+            x_ = self.spatial_attn(x_)
         x = x + x_
         x = rearrange(x, "(b t) s e -> b t s e", t=t_len)
 
@@ -137,23 +145,28 @@ class SpatioTemporalBlock(nn.Module):
         self.norm2 = nn.LayerNorm(model_dim)
         self.norm3 = nn.LayerNorm(model_dim)
 
-    def forward(self, x: Tensor, causal_temporal: bool = False) -> Tensor:
+    def forward(self, x: Tensor, causal_temporal: bool = False, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         t_len, s_len = x.shape[1:3]
 
         # Spatial attention
         x = rearrange(x, "b t s e -> (b t) s e")
         x_ = self.norm1(x)
-        x_ = self.spatial_attn(x_)
+        if key_padding_mask is not None:
+            mask_s = rearrange(key_padding_mask, "b t s -> (b t) s")
+            x_ = self.spatial_attn(x_, key_padding_mask=~mask_s)
+        else:
+            x_ = self.spatial_attn(x_)
         x = x + x_
         x = rearrange(x, "(b t) s e -> b t s e", t=t_len)
 
         # Temporal attention
         x = rearrange(x, "b t s e -> (b s) t e")
         x_ = self.norm2(x)
-        if causal_temporal:
-            x_ = self.temporal_attn(x_, is_causal=True)
+        if key_padding_mask is not None:
+            mask_t = rearrange(key_padding_mask, "b t s -> (b s) t")
+            x_ = self.temporal_attn(x_, is_causal=causal_temporal, key_padding_mask=~mask_t)
         else:
-            x_ = self.temporal_attn(x_)
+            x_ = self.temporal_attn(x_, is_causal=causal_temporal)
         x = x + x_
         x = rearrange(x, "(b s) t e -> b t s e", s=s_len)
 
@@ -192,11 +205,11 @@ class SpatioTransformer(nn.Module):
         )
         self.out = nn.Linear(model_dim, out_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         x = self.ffn(x)
         x = self.pos_enc(x)
         for block in self.transformer_blocks:
-            x = block(x)
+            x = block(x, key_padding_mask=key_padding_mask)
         x = self.out(x)
         return x  # (B, T, E)
 
@@ -231,13 +244,38 @@ class SpatioTemporalTransformer(nn.Module):
         self.out = nn.Linear(model_dim, out_dim)
         self.causal_temporal = causal_temporal
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         x = self.ffn(x)
         x = self.pos_enc(x)
         for block in self.transformer_blocks:
-            x = block(x, self.causal_temporal)
+            x = block(x, self.causal_temporal, key_padding_mask=key_padding_mask)
         x = self.out(x)
         return x  # (B, T, E)
+
+
+class CrossAttention(nn.Module):
+    """Cross-attention module for slot-patch fusion in the decoder."""
+
+    def __init__(self, model_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super(CrossAttention, self).__init__()
+        inner_dim = model_dim // num_heads
+        self.scale = inner_dim ** -0.5
+        self.heads = num_heads
+        self.to_q = nn.Linear(model_dim, model_dim, bias=False)
+        self.to_k = nn.Linear(model_dim, model_dim, bias=False)
+        self.to_v = nn.Linear(model_dim, model_dim, bias=False)
+        self.to_out = nn.Sequential(nn.Linear(model_dim, model_dim), nn.Dropout(dropout))
+
+    def forward(self, q: Tensor, kv: Tensor) -> Tensor:
+        B, N, D = q.shape
+        K = kv.shape[1]
+        q = self.to_q(q).reshape(B, N, self.heads, D // self.heads).permute(0, 2, 1, 3)
+        k = self.to_k(kv).reshape(B, K, self.heads, D // self.heads).permute(0, 2, 1, 3)
+        v = self.to_v(kv).reshape(B, K, self.heads, D // self.heads).permute(0, 2, 1, 3)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        return self.to_out(out)
 
 
 class VectorQuantizer(nn.Module):
@@ -326,3 +364,25 @@ class ResidualVectorQuantizer(VectorQuantizer):
         # Straight through estimator
         z_q = x + (z - x).detach()
         return z_q + inner_z_q, z, x, indices, inner_z, inner_x, inner_indices
+
+
+class ObjectReconHead(nn.Module):
+    """
+    对象级重建头。
+
+    从隐动作预测 slot 特征的帧间差分，提供无监督对象级学习信号。
+    Input:  z: (B, T-1, K, latent_dim)
+    Output: delta_pred: (B, T-1, K, model_dim)
+    """
+
+    def __init__(self, latent_dim: int, model_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, model_dim),
+        )
+
+    def forward(self, z: Tensor) -> Tensor:
+        return self.net(z)
