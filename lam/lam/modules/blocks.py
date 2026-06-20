@@ -386,3 +386,110 @@ class ObjectReconHead(nn.Module):
 
     def forward(self, z: Tensor) -> Tensor:
         return self.net(z)
+
+
+def compute_subject_positions(masks: Tensor) -> Tensor:
+    """
+    从二值 mask 计算每个主体的质心位置。
+
+    Args:
+        masks: (B, T, A, H, W) float32 binary
+
+    Returns:
+        positions: (B, T, A, 2) float32, normalized [0,1]
+    """
+    B, T, A, H, W = masks.shape
+    device = masks.device
+    ys = torch.arange(H, device=device).view(1, 1, 1, H, 1)
+    xs = torch.arange(W, device=device).view(1, 1, 1, 1, W)
+    mask_sum = masks.sum(dim=(-2, -1)).clamp(min=1e-6)
+    cy = (masks * ys.to(masks.dtype)).sum(dim=(-2, -1)) / mask_sum
+    cx = (masks * xs.to(masks.dtype)).sum(dim=(-2, -1)) / mask_sum
+    return torch.stack([cx / W, cy / H], dim=-1)
+
+
+class MaskedPool(nn.Module):
+    """
+    Mask-Guided 特征池化。
+
+    将 patch 级别的特征按 GT mask 区域加权平均池化，得到每个主体的特征向量。
+
+    Input:
+        patches: (B, T, N, D)  — patch 特征
+        masks:   (B, T, A, H, W) — 逐主体二值 mask (A = max_actors)
+
+    Output:
+        obj_feats: (B, T, A, D) — 每个主体的聚合特征
+        valid_mask: (B, T, A)   — 该主体是否存在的指示 (mask 非空)
+    """
+
+    def __init__(self, grid_h: int, grid_w: int):
+        super().__init__()
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        self.num_patches = grid_h * grid_w
+
+    def forward(self, patches: Tensor, masks: Tensor) -> Tuple[Tensor, Tensor]:
+        B, T, N, D = patches.shape
+        *_, A, H, W = masks.shape
+        assert H % self.grid_h == 0 and W % self.grid_w == 0, \
+            f"mask size ({H}x{W}) must be divisible by grid ({self.grid_h}x{self.grid_w})"
+
+        # 1. 将 mask 下采样到 patch 级别
+        masks_flat = masks.reshape(B * T * A, 1, H, W)
+        masks_down = F.adaptive_avg_pool2d(masks_flat, (self.grid_h, self.grid_w))
+        masks_down = masks_down.reshape(B, T, A, self.num_patches)
+
+        # 2. 检测哪些主体存在 (mask 非空)
+        valid_mask = masks_down.sum(dim=-1) > 0.5  # (B, T, A), bool
+
+        # 3. 加权平均池化
+        weights = masks_down.unsqueeze(-1)                # (B, T, A, N, 1)
+        feat = patches.unsqueeze(2) * weights             # (B, T, A, N, D)
+        mask_sum = weights.sum(dim=-2)                    # (B, T, A, 1)
+        mask_sum = mask_sum + (mask_sum < 1e-6).float() * 1e-6
+        obj_feats = feat.sum(dim=-2) / mask_sum           # (B, T, A, D)
+
+        return obj_feats, valid_mask
+
+
+class ObjectSpatioTemporalAttention(nn.Module):
+    """
+    对象级时空注意力模块。
+
+    对 (K)×T 的二维特征矩阵做 Transformer Self-Attention，
+    同时建模主体间交互（空间）和时序动态（时间）。
+
+    Input:  obj_feats (B, T, K, D)
+            valid_mask (B, T, K)  — True=有效, False=padding
+    Output: obj_feats (B, T, K, D)
+    """
+
+    def __init__(self, dim: int, num_heads: int = 8, num_layers: int = 2,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.dim = dim
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=num_heads,
+            dim_feedforward=dim * 4, dropout=dropout,
+            activation='gelu', batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers
+        )
+
+    def forward(self, obj_feats: Tensor, valid_mask: Optional[Tensor] = None) -> Tensor:
+        B, T, A1, D = obj_feats.shape
+
+        seq = obj_feats.reshape(B, T * A1, D)
+
+        if valid_mask is not None:
+            pad = valid_mask.reshape(B, T * A1)
+            padding_mask = ~pad  # True = mask out
+            padding_mask = padding_mask.to(torch.bool)
+        else:
+            padding_mask = None
+
+        out = self.transformer(seq, src_key_padding_mask=padding_mask)
+        out = out.reshape(B, T, A1, D)
+        return out

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "lark-mcp": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@larksuiteoapi/lark-mcp",
+        "mcp",
+        "-a",
+        "{env:FEISHU_APP_ID}",
+        "-s",
+        "{env:FEISHU_APP_SECRET}",
+        "-t",
+        "preset.doc.default,docx.v1.document.create,docx.v1.document.get,docx.v1.document.convert,docx.v1.documentBlock.list,docx.v1.documentBlock.get,docx.v1.documentBlockChildren.create,docx.v1.documentBlock.patch,docx.v1.documentBlockChildren.batchDelete",
+        "-l",
+        "zh"
+      ],
+      "enabled": true
+    }
+  }
+}

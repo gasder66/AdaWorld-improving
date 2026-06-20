@@ -68,6 +68,7 @@ class A2DDataset(Dataset):
             img_size: int = 256,
             use_pixel_mask: bool = False,
             min_actors: int = 1,
+            frame_stride: int = 1,
     ) -> None:
         super().__init__()
         self.data_root = data_root
@@ -78,6 +79,7 @@ class A2DDataset(Dataset):
         self.img_size = img_size
         self.use_pixel_mask = use_pixel_mask
         self.min_actors = min_actors
+        self.frame_stride = frame_stride
 
         # 读取 videoset.csv
         csv_path = os.path.join(release_root, "videoset.csv")
@@ -142,14 +144,15 @@ class A2DDataset(Dataset):
             # 读取标注帧的帧号
             frame_nums = [int(f.replace(".mat", "")) for f in mat_files]
 
-            # 滑动窗口生成样本
-            for start_idx in range(0, len(mat_files) - self.num_frames + 1, self.num_frames):
-                end_idx = start_idx + self.num_frames
-                if end_idx > len(mat_files):
+            # 滑动窗口 (frame_stride 控制帧间跳步, 扩大时间窗口)
+            num_needed = (self.num_frames - 1) * self.frame_stride + 1
+            for start_idx in range(0, len(mat_files) - num_needed + 1, 1):
+                selected_indices = [start_idx + i * self.frame_stride for i in range(self.num_frames)]
+                if max(selected_indices) >= len(mat_files):
                     break
 
-                sample_mats = mat_files[start_idx:end_idx]
-                sample_frames = frame_nums[start_idx:end_idx]
+                sample_mats = [mat_files[i] for i in selected_indices]
+                sample_frames = [frame_nums[i] for i in selected_indices]
 
                 # 检查是否有足够的主体
                 try:
@@ -286,7 +289,8 @@ class A2DDataset(Dataset):
         return {
             "videos": videos,
             "masks": masks,
-            "actions": actions,
+            "actions": actions,      # (T-1, max_actors) 动作标签
             "num_actors": min(max_n, self.max_actors),
             "video_id": vid,
+            "actor_ids": torch.tensor([(all_actors[0][a] if a < len(all_actors[0]) else -1) for a in range(self.max_actors)]),
         }
