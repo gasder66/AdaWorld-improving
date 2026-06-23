@@ -1,0 +1,16 @@
+{
+  "model": "V6c (model_v6c_long.pt)",
+  "n_samples": 7680,
+  "n_valid": 5832,
+  "action_nmi": 0.0525,
+  "action_ari": 0.0239,
+  "actor_leakage_acc": 1.0,
+  "actor_leakage_chance": 0.25,
+  "per_slot_nmi": [
+    0.3945,
+    0.3029,
+    0.3417,
+    0.515
+  ],
+  "per_slot_nmi_avg": 0.3885
+}
