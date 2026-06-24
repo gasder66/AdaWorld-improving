@@ -9,6 +9,7 @@
 /lam/results/
 /result/
 /pretrained/
+/reports/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
