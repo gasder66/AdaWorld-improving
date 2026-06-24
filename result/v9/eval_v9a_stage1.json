@@ -1,0 +1,34 @@
+{
+  "model": "V9-A (v9a_stage1)",
+  "variant": "A",
+  "n_samples": 6072,
+  "n_actions": 5,
+  "n_actors": 4,
+  "overall_nmi": 0.7723,
+  "overall_ari": 0.6944,
+  "per_actor_nmi": [
+    0.7787,
+    0.7834,
+    0.7536,
+    0.7578
+  ],
+  "per_actor_nmi_avg": 0.7684,
+  "actor_leakage_acc": 0.335,
+  "action_probe_acc": 0.8741,
+  "psnr_recon": 27.4,
+  "psnr_copy": 22.68,
+  "psnr_z0": 24.08,
+  "psnr_zshuffle": 22.83,
+  "ssim_recon": 0.796,
+  "ssim_copy": 0.4741,
+  "delta_psnr_copy": 4.72,
+  "delta_psnr_z0": 3.32,
+  "delta_psnr_zshuffle": 4.57,
+  "go_verdict": "GO",
+  "go_criteria": {
+    "z0_ge_1": true,
+    "zshuffle_ge_05": true,
+    "copy_ge_05": true
+  },
+  "vis_path": "/home/xiaojy/projects/AdaWorld-improving/lam/scripts/../../result/v9/recon_vis_v9a_stage1.png"
+}
