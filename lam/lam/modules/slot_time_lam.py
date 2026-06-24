@@ -135,26 +135,53 @@ class TransitionTokenBuilder(nn.Module):
 class SharedActorActionHead(nn.Module):
     """共享 actor action head: 所有 actor slot 共享一个 action latent space.
 
-    Stage 1: 无 actor 条件化 (合成数据只有 4 个固定 actor).
-    输出 (mu, logvar) for VAE.
+    Stage 2C: 可选 actor label FiLM 条件化。
+    actor label 是条件 (不是被编码进 z), 让 z_actor 编码
+    "相对于该 actor 类型的残差 action"。
     """
 
-    def __init__(self, model_dim: int, z_dim: int, var_min: float = -5.0, var_max: float = 3.0) -> None:
+    def __init__(
+        self,
+        model_dim: int,
+        z_dim: int,
+        num_actor_types: int = 0,
+        var_min: float = -5.0,
+        var_max: float = 3.0,
+    ) -> None:
         super().__init__()
         self.z_dim = z_dim
         self.var_min = var_min
         self.var_max = var_max
-        self.net = nn.Sequential(
-            nn.LayerNorm(model_dim),
-            nn.Linear(model_dim, model_dim),
-            nn.GELU(),
-            nn.LayerNorm(model_dim),
-            nn.Linear(model_dim, z_dim * 2),  # mu, logvar
-        )
+        self.num_actor_types = num_actor_types
+        self.use_conditioning = num_actor_types > 0
 
-    def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        """x: (..., D) -> {mu, logvar, z} (..., z_dim)."""
-        moments = self.net(x)
+        self.norm1 = nn.LayerNorm(model_dim)
+        self.fc1 = nn.Linear(model_dim, model_dim)
+        self.norm2 = nn.LayerNorm(model_dim)
+        self.fc2 = nn.Linear(model_dim, z_dim * 2)
+
+        if self.use_conditioning:
+            # FiLM: actor_label -> (gamma, beta) to modulate fc1 output
+            self.film = nn.Sequential(
+                nn.Embedding(num_actor_types + 1, model_dim * 2),  # +1 for unknown (-1→0)
+                nn.LayerNorm(model_dim * 2),
+            )
+
+    def forward(self, x: Tensor, actor_labels: Tensor = None) -> Dict[str, Tensor]:
+        """x: (..., D), actor_labels: (...,) long or None -> {mu, logvar, z}."""
+        h = self.norm1(x)
+        h = self.fc1(h)
+        h = F.gelu(h)
+
+        if self.use_conditioning and actor_labels is not None:
+            # actor_labels: (...,) with -1 for invalid → clamp to 0
+            labels = actor_labels.clamp(min=0).long()
+            film_params = self.film(labels)  # (..., 2*D)
+            gamma, beta = torch.chunk(film_params, 2, dim=-1)  # each (..., D)
+            h = h * (1 + gamma) + beta  # FiLM modulation
+
+        h = self.norm2(h)
+        moments = self.fc2(h)
         mu, logvar = torch.chunk(moments, 2, dim=-1)
         logvar = torch.clamp(logvar, self.var_min, self.var_max)
         if self.training:
@@ -279,6 +306,7 @@ class LatentActionModelV8(nn.Module):
         use_bg_slot: bool = True,
         bg_loss_weight: float = 1.0,
         camera_param_scale=(8.0, 8.0, 0.1, 0.05),
+        num_actor_types: int = 0,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -290,6 +318,7 @@ class LatentActionModelV8(nn.Module):
         self.bbox_scale = bbox_scale
         self.use_bg_slot = use_bg_slot
         self.bg_loss_weight = bg_loss_weight
+        self.num_actor_types = num_actor_types
         self.register_buffer("cam_scale", torch.tensor(camera_param_scale, dtype=torch.float32))
 
         K = max_actors + 1  # +1 for bg
@@ -316,7 +345,7 @@ class LatentActionModelV8(nn.Module):
         ])
 
         # 5. Heads
-        self.actor_action_head = SharedActorActionHead(model_dim, z_dim)
+        self.actor_action_head = SharedActorActionHead(model_dim, z_dim, num_actor_types=num_actor_types)
         if use_bg_slot:
             self.bg_motion_head = BackgroundMotionHead(model_dim, z_bg_dim)
             self.camera_motion_pred = CameraMotionPredictor(z_bg_dim, img_size=img_size)
@@ -331,13 +360,14 @@ class LatentActionModelV8(nn.Module):
         kl_dim = kl_dim.clamp(min=self.free_bits_lambda)
         return kl_dim.sum() / mu.reshape(-1).shape[0]
 
-    def encode(self, video: Tensor, boxes: Tensor, valid_mask: Tensor) -> Dict[str, Tensor]:
+    def encode(self, video: Tensor, boxes: Tensor, valid_mask: Tensor, actor_labels: Tensor = None) -> Dict[str, Tensor]:
         """编码 -> z_actor, z_bg.
 
         Args:
             video: (B, T, H, W, 3)
             boxes: (B, T, K, 4)
             valid_mask: (B, T, K) bool
+            actor_labels: (B, K) long, A2D actor type (optional, for conditioning)
         Returns:
             dict with z_actor, mu_actor, logvar_actor, z_bg, mu_bg, logvar_bg,
                      transition_tokens, motion_tokens
@@ -369,7 +399,12 @@ class LatentActionModelV8(nn.Module):
 
         # 5. Heads
         # actor slots (index 1..K)
-        actor_out = self.actor_action_head(x[:, :, 1:])  # (B, T-1, K, d_z)
+        # actor_labels for FiLM: (B, K) → (B, T-1, K) by broadcasting
+        if actor_labels is not None and self.num_actor_types > 0:
+            al = actor_labels.unsqueeze(1).expand(-1, x.shape[1], -1)  # (B, T-1, K)
+        else:
+            al = None
+        actor_out = self.actor_action_head(x[:, :, 1:], actor_labels=al)  # (B, T-1, K, d_z)
 
         result = {
             "z_actor": actor_out["z"], "mu_actor": actor_out["mu"], "logvar_actor": actor_out["logvar"],
@@ -394,10 +429,11 @@ class LatentActionModelV8(nn.Module):
         video = batch["videos"]
         boxes = batch["boxes"]
         valid_mask = batch["valid_mask"]
+        actor_labels = batch.get("actor_labels", None)
         camera_params = batch.get("camera_params", None)
 
         B, T, K, _ = boxes.shape
-        out = self.encode(video, boxes, valid_mask)
+        out = self.encode(video, boxes, valid_mask, actor_labels=actor_labels)
 
         z_actor = out["z_actor"]      # (B, T-1, K, d_z)
         mu_actor = out["mu_actor"]

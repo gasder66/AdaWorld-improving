@@ -45,6 +45,8 @@ def main():
     parser.add_argument("--kl_beta", type=float, default=1.0)
     parser.add_argument("--free_bits_lambda", type=float, default=0.5)
     parser.add_argument("--bbox_scale", type=float, default=48.0)
+    parser.add_argument("--num_actor_types", type=int, default=0,
+                        help="A2D actor type count for FiLM conditioning (0=no conditioning, 7=A2D)")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--checkpoint_every", type=int, default=500)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -66,6 +68,7 @@ def main():
     print(f"  GPU={args.gpu}, name={args.name}")
     print(f"  batch={args.batch_size}, steps={args.steps}, lr={args.lr}")
     print(f"  bbox_scale={args.bbox_scale}, kl_beta={args.kl_beta}")
+    print(f"  num_actor_types={args.num_actor_types} ({'FiLM conditioning' if args.num_actor_types > 0 else 'no conditioning'})")
     print(f"{'='*60}")
 
     train_dataset = A2DBoxDataset(
@@ -82,7 +85,7 @@ def main():
         num_temporal_layers=args.num_temporal_layers, num_slot_layers=args.num_slot_layers,
         num_heads=args.num_heads, max_actors=args.max_actors, crop_size=args.crop_size,
         free_bits_lambda=args.free_bits_lambda, bbox_scale=args.bbox_scale,
-        use_bg_slot=True,
+        use_bg_slot=True, num_actor_types=args.num_actor_types,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
