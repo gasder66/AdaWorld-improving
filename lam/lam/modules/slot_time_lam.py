@@ -192,25 +192,32 @@ class BackgroundMotionHead(nn.Module):
 
 
 class CameraMotionPredictor(nn.Module):
-    """从 z_bg 预测全局相机运动 (Δbbox_bg per actor).
+    """从 z_bg + bbox 预测全局相机运动对每个 actor bbox 的影响 (Δbbox_bg).
 
-    输入: z_bg (B, T-1, d_bg)
+    输入: z_bg (B, T-1, d_bg), bbox_t (B, T-1, K, 4)
     输出: Δbbox_bg (B, T-1, K, 4) — 每个 actor 受到的全局运动
+
+    条件化 bbox 使模型能学习 zoom 效应 (边缘 bbox 移动更多)。
     """
 
-    def __init__(self, z_bg_dim: int, hidden_dim: int = 64) -> None:
+    def __init__(self, z_bg_dim: int, hidden_dim: int = 64, img_size: int = 256) -> None:
         super().__init__()
+        self.img_size = img_size
         self.net = nn.Sequential(
-            nn.LayerNorm(z_bg_dim),
-            nn.Linear(z_bg_dim, hidden_dim),
+            nn.LayerNorm(z_bg_dim + 4),
+            nn.Linear(z_bg_dim + 4, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 4),  # dx, dy, dw, dh (全局)
+            nn.Linear(hidden_dim, 4),
         )
 
-    def forward(self, z_bg: Tensor, K: int) -> Tensor:
-        """z_bg: (B, T-1, d_bg) -> Δbbox_bg: (B, T-1, K, 4)."""
-        delta = self.net(z_bg)  # (B, T-1, 4)
-        return delta.unsqueeze(2).expand(-1, -1, K, -1)  # 广播到 K 个 actor
+    def forward(self, z_bg: Tensor, bbox_t: Tensor) -> Tensor:
+        """z_bg: (B, T-1, d_bg), bbox_t: (B, T-1, K, 4) -> Δbbox_bg: (B, T-1, K, 4)."""
+        B, T1, d = z_bg.shape
+        K = bbox_t.shape[2]
+        z_bg_exp = z_bg.unsqueeze(2).expand(-1, -1, K, -1)  # (B, T-1, K, d)
+        bbox_norm = bbox_t / self.img_size  # 归一化到 [0, 1]
+        inp = torch.cat([z_bg_exp, bbox_norm], dim=-1)  # (B, T-1, K, d+4)
+        return self.net(inp)
 
 
 class ActorMotionPredictor(nn.Module):
@@ -233,6 +240,26 @@ class ActorMotionPredictor(nn.Module):
         return self.net(z_actor)
 
 
+class BgSupervisionHead(nn.Module):
+    """从 z_bg 预测相机参数 (用于 L_bg 直接监督).
+
+    输入: z_bg (B, T-1, d_bg)
+    输出: camera_params_pred (B, T-1, 4) [dx, dy, dscale, dbright]
+    """
+
+    def __init__(self, z_bg_dim: int, hidden_dim: int = 64) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(z_bg_dim),
+            nn.Linear(z_bg_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 4),
+        )
+
+    def forward(self, z_bg: Tensor) -> Tensor:
+        return self.net(z_bg)
+
+
 class LatentActionModelV8(nn.Module):
     """V8 MOT-Guided Slot-Time Latent Action Model."""
 
@@ -249,6 +276,9 @@ class LatentActionModelV8(nn.Module):
         img_size: int = 256,
         free_bits_lambda: float = 0.5,
         bbox_scale: float = 32.0,
+        use_bg_slot: bool = True,
+        bg_loss_weight: float = 1.0,
+        camera_param_scale=(8.0, 8.0, 0.1, 0.05),
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -258,6 +288,9 @@ class LatentActionModelV8(nn.Module):
         self.max_actors = max_actors
         self.free_bits_lambda = free_bits_lambda
         self.bbox_scale = bbox_scale
+        self.use_bg_slot = use_bg_slot
+        self.bg_loss_weight = bg_loss_weight
+        self.register_buffer("cam_scale", torch.tensor(camera_param_scale, dtype=torch.float32))
 
         K = max_actors + 1  # +1 for bg
         self.K = K
@@ -284,10 +317,12 @@ class LatentActionModelV8(nn.Module):
 
         # 5. Heads
         self.actor_action_head = SharedActorActionHead(model_dim, z_dim)
-        self.bg_motion_head = BackgroundMotionHead(model_dim, z_bg_dim)
+        if use_bg_slot:
+            self.bg_motion_head = BackgroundMotionHead(model_dim, z_bg_dim)
+            self.camera_motion_pred = CameraMotionPredictor(z_bg_dim, img_size=img_size)
+            self.bg_supervision_head = BgSupervisionHead(z_bg_dim)
 
         # 6. Motion predictors (for L_motion)
-        self.camera_motion_pred = CameraMotionPredictor(z_bg_dim)
         self.actor_motion_pred = ActorMotionPredictor(z_dim)
 
     def _free_bits_kl(self, mu: Tensor, logvar: Tensor) -> Tensor:
@@ -322,37 +357,44 @@ class LatentActionModelV8(nn.Module):
         x = x.permute(0, 2, 1, 3)  # (B, T-1, K+1, D)
 
         # 4. Slot attention (per timestep across slots)
-        # valid mask for slots: bg always valid, actors per valid_mask
+        # valid mask for slots: bg always valid (if use_bg_slot), actors per valid_mask
         T1 = x.shape[1]
         slot_valid = torch.zeros(B, T1, self.K, dtype=torch.bool, device=x.device)
-        slot_valid[:, :, 0] = True  # bg always valid
+        if self.use_bg_slot:
+            slot_valid[:, :, 0] = True  # bg always valid
         slot_valid[:, :, 1:] = valid_mask[:, 1:]  # actor valid from t=1 onward (transitions)
 
         for block in self.slot_blocks:
             x = block(x, key_padding_mask=slot_valid)
 
         # 5. Heads
-        # bg slot (index 0)
-        bg_out = self.bg_motion_head(x[:, :, 0])  # (B, T-1, d_bg)
         # actor slots (index 1..K)
         actor_out = self.actor_action_head(x[:, :, 1:])  # (B, T-1, K, d_z)
 
-        return {
+        result = {
             "z_actor": actor_out["z"], "mu_actor": actor_out["mu"], "logvar_actor": actor_out["logvar"],
-            "z_bg": bg_out["z"], "mu_bg": bg_out["mu"], "logvar_bg": bg_out["logvar"],
             "transition_tokens": trans,
             "motion_tokens": motion_tokens,
         }
 
+        if self.use_bg_slot:
+            bg_out = self.bg_motion_head(x[:, :, 0])  # (B, T-1, d_bg)
+            result["z_bg"] = bg_out["z"]
+            result["mu_bg"] = bg_out["mu"]
+            result["logvar_bg"] = bg_out["logvar"]
+
+        return result
+
     def forward(self, batch: Dict) -> Dict[str, Tensor]:
         """前向传播 + 损失计算.
 
-        batch keys: videos, boxes, valid_mask
+        batch keys: videos, boxes, valid_mask, [camera_params]
         Returns: losses + latents
         """
         video = batch["videos"]
         boxes = batch["boxes"]
         valid_mask = batch["valid_mask"]
+        camera_params = batch.get("camera_params", None)
 
         B, T, K, _ = boxes.shape
         out = self.encode(video, boxes, valid_mask)
@@ -360,35 +402,35 @@ class LatentActionModelV8(nn.Module):
         z_actor = out["z_actor"]      # (B, T-1, K, d_z)
         mu_actor = out["mu_actor"]
         logvar_actor = out["logvar_actor"]
-        z_bg = out["z_bg"]            # (B, T-1, d_bg)
-        mu_bg = out["mu_bg"]
-        logvar_bg = out["logvar_bg"]
 
         # === L_motion ===
-        # Δbbox_obs = boxes[t+1] - boxes[t]
         dbbox_obs = boxes[:, 1:] - boxes[:, :-1]  # (B, T-1, K, 4)
-
-        # Δbbox_bg = CameraMotion(z_bg)
-        dbbox_bg = self.camera_motion_pred(z_bg, K)  # (B, T-1, K, 4)
-
-        # Δbbox_res = ActorMotion(z_actor)
         dbbox_res = self.actor_motion_pred(z_actor)  # (B, T-1, K, 4)
 
-        # Δbbox_pred = bg + res
-        dbbox_pred = dbbox_bg + dbbox_res
+        if self.use_bg_slot:
+            z_bg = out["z_bg"]
+            mu_bg = out["mu_bg"]
+            logvar_bg = out["logvar_bg"]
+            # CameraMotion(z_bg, bbox_t) → Δbbox_bg (条件化 bbox 位置)
+            bbox_t = boxes[:, :-1]  # (B, T-1, K, 4) — bbox at time t
+            dbbox_bg = self.camera_motion_pred(z_bg, bbox_t)  # (B, T-1, K, 4)
+            dbbox_pred = dbbox_bg + dbbox_res
+        else:
+            dbbox_bg = torch.zeros_like(dbbox_res)
+            dbbox_pred = dbbox_res
 
-        # 只对 valid actor 计算 loss
-        # valid_mask: (B, T, K), 需要的是 (B, T-1, K) for transitions
         actor_valid = valid_mask[:, 1:].unsqueeze(-1).float()  # (B, T-1, K, 1)
-        # 归一化到 O(1) 尺度 (cell_size=32), 使 motion_loss 与 kl_loss 可比
         dbbox_pred_n = dbbox_pred / self.bbox_scale
         dbbox_obs_n = dbbox_obs / self.bbox_scale
         motion_loss = ((dbbox_pred_n - dbbox_obs_n) ** 2 * actor_valid).sum() / (actor_valid.sum() * 4 + 1e-8)
 
         # === L_KL (Free Bits) ===
         kl_actor = self._free_bits_kl(mu_actor, logvar_actor)
-        kl_bg = self._free_bits_kl(mu_bg, logvar_bg)
-        kl_loss = kl_actor + kl_bg
+        if self.use_bg_slot:
+            kl_bg = self._free_bits_kl(mu_bg, logvar_bg)
+            kl_loss = kl_actor + kl_bg
+        else:
+            kl_loss = kl_actor
 
         out["motion_loss"] = motion_loss
         out["kl_loss"] = kl_loss
@@ -396,4 +438,14 @@ class LatentActionModelV8(nn.Module):
         out["dbbox_obs"] = dbbox_obs
         out["dbbox_bg"] = dbbox_bg
         out["dbbox_res"] = dbbox_res
+
+        # === L_bg (相机参数直接监督) ===
+        if self.use_bg_slot and camera_params is not None:
+            cam_pred = self.bg_supervision_head(z_bg)  # (B, T-1, 4)
+            cam_target = camera_params / self.cam_scale  # 归一化到 O(1)
+            bg_loss = ((cam_pred - cam_target) ** 2).mean()
+            out["bg_loss"] = bg_loss
+        else:
+            out["bg_loss"] = torch.tensor(0.0, device=video.device)
+
         return out

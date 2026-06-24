@@ -1,20 +1,25 @@
 """
-V8: MOT-Guided Slot-Time Latent Action Model (Stage 1)
+V8: MOT-Guided Slot-Time Latent Action Model
 
-损失:
+Stage 1 (无相机扰动):
   L = L_motion + β · L_KL
 
-  L_motion = MSE( (Δbbox_bg + Δbbox_res) / scale, Δbbox_obs / scale )
-  L_KL     = FreeBits(z_actor) + FreeBits(z_bg)
-
-Stage 1 限制:
-  - 合成数据 + GT bbox
-  - 无 actor conditioning
-  - 无 camera perturbation (z_bg 预期学到 ~0)
+Stage 2A (相机扰动 + bg 验证):
+  L = L_motion + β · L_KL + γ · L_bg
+  camera_perturbation=True, 可选 use_bg_slot=False 做 ablation
 
 用法:
+  # Stage 1
   CUDA_VISIBLE_DEVICES=2 PYTHONPATH=lam python lam/scripts/run_v8_mot_lam.py \\
-      --name v8_stage1 --batch_size 16 --steps 5000 --lr 1e-4 --kl_beta 1.0
+      --name v8_stage1 --batch_size 16 --steps 5000 --lr 1e-4
+
+  # Stage 2A with-bg
+  CUDA_VISIBLE_DEVICES=2 PYTHONPATH=lam python lam/scripts/run_v8_mot_lam.py \\
+      --name v8_s2a_bg --camera_perturbation --steps 5000
+
+  # Stage 2A no-bg (ablation)
+  CUDA_VISIBLE_DEVICES=2 PYTHONPATH=lam python lam/scripts/run_v8_mot_lam.py \\
+      --name v8_s2a_nobg --camera_perturbation --no_bg_slot --steps 5000
 """
 import os, sys, json, time, argparse
 os.environ["PYTHONUNBUFFERED"] = "1"
@@ -51,6 +56,16 @@ def main():
     parser.add_argument("--checkpoint_every", type=int, default=500)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    # Stage 2A: camera perturbation
+    parser.add_argument("--camera_perturbation", action="store_true",
+                        help="启用 on-the-fly 相机扰动 (pan/zoom/brightness)")
+    parser.add_argument("--pan_range", type=float, default=8.0)
+    parser.add_argument("--zoom_range", type=float, default=0.1)
+    parser.add_argument("--brightness_range", type=float, default=0.05)
+    parser.add_argument("--no_bg_slot", action="store_true",
+                        help="禁用 bg slot (V8-no-bg ablation)")
+    parser.add_argument("--bg_loss_weight", type=float, default=1.0,
+                        help="L_bg 权重 (γ)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -72,26 +87,46 @@ def main():
     else:
         data_root = args.data_root
 
+    use_bg = not args.no_bg_slot
+    cam_str = (
+        f"camera_perturbation ON (pan={args.pan_range}, zoom={args.zoom_range}, bright={args.brightness_range})"
+        if args.camera_perturbation else "no camera perturbation"
+    )
     print(f"\n{'='*60}")
-    print(f"V8: MOT-Guided Slot-Time Latent Action Model (Stage 1)")
+    print(f"V8: MOT-Guided Slot-Time Latent Action Model")
     print(f"  GPU={args.gpu}, name={args.name}")
     print(f"  batch={args.batch_size}, steps={args.steps}, lr={args.lr}")
     print(f"  model_dim={args.model_dim}, z_dim={args.z_dim}, z_bg_dim={args.z_bg_dim}")
     print(f"  temporal_layers={args.num_temporal_layers}, slot_layers={args.num_slot_layers}")
     print(f"  kl_beta={args.kl_beta}, free_bits_lambda={args.free_bits_lambda}")
-    print(f"  Loss: L_motion + {args.kl_beta} * L_KL")
+    print(f"  use_bg_slot={use_bg}, bg_loss_weight={args.bg_loss_weight}")
+    print(f"  {cam_str}")
+    loss_str = f"L = L_motion + {args.kl_beta}*L_KL"
+    if use_bg and args.camera_perturbation:
+        loss_str += f" + {args.bg_loss_weight}*L_bg"
+    print(f"  Loss: {loss_str}")
     print(f"  数据: {data_root}")
     print(f"{'='*60}")
+
+    cam_kwargs = dict(
+        camera_perturbation=args.camera_perturbation,
+        pan_range=args.pan_range,
+        zoom_range=args.zoom_range,
+        brightness_range=args.brightness_range,
+    ) if args.camera_perturbation else {}
 
     train_dataset = MOTSlotDataset(
         os.path.join(data_root, "train"),
         max_actors=args.max_actors, num_frames=args.num_frames,
+        **cam_kwargs,
     )
     eval_dataset = MOTSlotDataset(
         os.path.join(data_root, "val"),
         max_actors=args.max_actors, num_frames=args.num_frames,
+        **cam_kwargs,
     )
 
+    cam_scale = (args.pan_range, args.pan_range, args.zoom_range, args.brightness_range)
     model = LatentActionModelV8(
         model_dim=args.model_dim,
         z_dim=args.z_dim,
@@ -102,6 +137,9 @@ def main():
         max_actors=args.max_actors,
         crop_size=args.crop_size,
         free_bits_lambda=args.free_bits_lambda,
+        use_bg_slot=use_bg,
+        bg_loss_weight=args.bg_loss_weight,
+        camera_param_scale=cam_scale,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -116,7 +154,7 @@ def main():
         drop_last=True,
     )
 
-    losses = {"total": [], "motion": [], "kl": []}
+    losses = {"total": [], "motion": [], "kl": [], "bg": []}
     step = 0
     t0 = time.time()
     torch.cuda.reset_peak_memory_stats(device)
@@ -125,14 +163,12 @@ def main():
         for batch in dataloader:
             if step >= args.steps:
                 break
-            videos = batch["videos"].to(device, non_blocking=True)
-            boxes = batch["boxes"].to(device, non_blocking=True)
-            valid = batch["valid_mask"].to(device, non_blocking=True)
-
-            outputs = model({"videos": videos, "boxes": boxes, "valid_mask": valid})
+            batch_gpu = {k: v.to(device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            outputs = model(batch_gpu)
             motion_loss = outputs["motion_loss"]
             kl_loss = outputs["kl_loss"]
-            loss = motion_loss + args.kl_beta * kl_loss
+            bg_loss = outputs["bg_loss"]
+            loss = motion_loss + args.kl_beta * kl_loss + args.bg_loss_weight * bg_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -142,6 +178,7 @@ def main():
             losses["total"].append(float(loss))
             losses["motion"].append(float(motion_loss))
             losses["kl"].append(float(kl_loss))
+            losses["bg"].append(float(bg_loss))
 
             if step % 50 == 0:
                 elapsed = time.time() - t0
@@ -150,8 +187,8 @@ def main():
                 print(
                     f"  Step {step:4d}/{args.steps}: "
                     f"loss={float(loss):.4f}, motion={float(motion_loss):.4f}, "
-                    f"kl={float(kl_loss):.4f}, z_var={z_var:.4f}, "
-                    f"mem={mem:.1f}GB, {elapsed:.0f}s"
+                    f"kl={float(kl_loss):.4f}, bg={float(bg_loss):.4f}, "
+                    f"z_var={z_var:.4f}, mem={mem:.1f}GB, {elapsed:.0f}s"
                 )
 
             if (step + 1) % args.checkpoint_every == 0:
@@ -174,7 +211,9 @@ def main():
     model.eval()
     results = {
         "architecture": "v8_mot_lam",
-        "stage": "stage1_synthetic",
+        "stage": "stage2a_camera" if args.camera_perturbation else "stage1_synthetic",
+        "use_bg_slot": use_bg,
+        "camera_perturbation": args.camera_perturbation,
         "max_actors": args.max_actors,
         "model_dim": args.model_dim,
         "z_dim": args.z_dim,
@@ -183,6 +222,7 @@ def main():
         "num_slot_layers": args.num_slot_layers,
         "kl_beta": args.kl_beta,
         "free_bits_lambda": args.free_bits_lambda,
+        "bg_loss_weight": args.bg_loss_weight,
         "training_steps": args.steps,
         "training_time_s": training_time,
         "peak_memory_gb": round(mem_peak, 2),
@@ -199,20 +239,20 @@ def main():
     all_actor_ids = []
     all_dbbox_pred = []
     all_dbbox_obs = []
+    all_camera_params = []
     n_collected = 0
     with torch.no_grad():
         for batch in eval_loader:
-            videos = batch["videos"].to(device)
-            boxes = batch["boxes"].to(device)
-            valid = batch["valid_mask"].to(device)
+            batch_gpu = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
             actions = batch["actions"]      # (B, T-1, K)
             track_ids = batch["track_ids"]  # (B, K)
-            out = model({"videos": videos, "boxes": boxes, "valid_mask": valid})
-            # z_actor: (B, T-1, K, D) — 收集所有 transition 的样本
-            z_a = out["mu_actor"].cpu().numpy()       # (B, T-1, K, D)
-            z_b = out["mu_bg"].cpu().numpy()           # (B, T-1, D)
-            v_np = valid[:, 1:].cpu().numpy()          # (B, T-1, K)
-            act_np = actions.cpu().numpy()             # (B, T-1, K)
+            cam_params = batch.get("camera_params", None)  # (B, T-1, 4) or None
+            out = model(batch_gpu)
+            z_a = out["mu_actor"].cpu().numpy()
+            z_b = out["mu_bg"].cpu().numpy() if "mu_bg" in out else np.zeros((z_a.shape[0], z_a.shape[1], args.z_bg_dim))
+            v_np = valid = batch["valid_mask"][:, 1:].cpu().numpy()
+            act_np = actions.cpu().numpy()
+            cam_np = cam_params.cpu().numpy() if cam_params is not None else None
             B, T1, K, D = z_a.shape
             for b in range(B):
                 for t in range(T1):
@@ -224,6 +264,8 @@ def main():
                             all_actor_ids.append(int(track_ids[b, k]))
                             all_dbbox_pred.append(out["dbbox_pred"][b, t, k].cpu().numpy())
                             all_dbbox_obs.append(out["dbbox_obs"][b, t, k].cpu().numpy())
+                            if cam_np is not None:
+                                all_camera_params.append(cam_np[b, t])
             n_collected += 1
             if n_collected >= 30:
                 break
@@ -234,6 +276,7 @@ def main():
     actor_ids_arr = np.array(all_actor_ids)
     dbbox_pred_arr = np.array(all_dbbox_pred)
     dbbox_obs_arr = np.array(all_dbbox_obs)
+    camera_params_arr = np.array(all_camera_params) if all_camera_params else None
 
     z_var = float(z_actor_arr.var(axis=0).mean())
     active = int((z_actor_arr.var(axis=0) > 0.01).sum())
@@ -247,14 +290,19 @@ def main():
     print(f"  dbbox MSE (pixel²): {results['dbbox_mse']:.2f}")
 
     # 保存隐变量供后续聚类评估
-    np.savez(
-        os.path.join(RESULTS_DIR, f"latents_{args.name}.npz"),
+    save_dict = dict(
         z_actor=z_actor_arr,
         z_bg=z_bg_arr,
         actions=actions_arr,
         actor_ids=actor_ids_arr,
         dbbox_pred=dbbox_pred_arr,
         dbbox_obs=dbbox_obs_arr,
+    )
+    if camera_params_arr is not None:
+        save_dict["camera_params"] = camera_params_arr
+    np.savez(
+        os.path.join(RESULTS_DIR, f"latents_{args.name}.npz"),
+        **save_dict,
     )
 
     save_path = os.path.join(RESULTS_DIR, f"results_{args.name}.json")

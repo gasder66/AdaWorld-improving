@@ -49,6 +49,7 @@ class MOTSlotDataset(Dataset):
     """V8 MOT Slot Table 数据集。
 
     包装底层 DiskSyntheticDataset, 增加 bbox / track_id / valid_mask 字段。
+    Stage 2A: 可选 camera_perturbation (pan/zoom/brightness on-the-fly)。
     """
 
     def __init__(
@@ -56,10 +57,18 @@ class MOTSlotDataset(Dataset):
         data_dir: str,
         max_actors: int = 4,
         num_frames: int = 5,
+        camera_perturbation: bool = False,
+        pan_range: float = 8.0,
+        zoom_range: float = 0.1,
+        brightness_range: float = 0.05,
     ) -> None:
         super().__init__()
         self.max_actors = max_actors
         self.num_frames = num_frames
+        self.camera_perturbation = camera_perturbation
+        self.pan_range = pan_range
+        self.zoom_range = zoom_range
+        self.brightness_range = brightness_range
         self.base = DiskSyntheticDataset(
             data_dir, max_actors=max_actors,
             num_frames=num_frames, output_format="t h w c",
@@ -87,15 +96,34 @@ class MOTSlotDataset(Dataset):
         for t in range(T):
             valid_mask[t, :int(s["num_actors"])] = True
 
-        return {
-            "videos": s["videos"],         # (T, H, W, 3)
-            "boxes": boxes,                # (T, K, 4)
-            "track_ids": track_ids,        # (K,)
+        videos = s["videos"]
+        camera_params = None
+
+        if self.camera_perturbation:
+            from lam.camera_perturbation import apply_camera_perturbation
+            out = apply_camera_perturbation(
+                videos, boxes, valid_mask,
+                pan_range=self.pan_range,
+                zoom_range=self.zoom_range,
+                brightness_range=self.brightness_range,
+                seed=idx,
+            )
+            videos = out["video"]
+            boxes = out["boxes"]
+            camera_params = out["camera_params"]  # (T-1, 4)
+
+        result = {
+            "videos": videos,            # (T, H, W, 3)
+            "boxes": boxes,              # (T, K, 4)
+            "track_ids": track_ids,      # (K,)
             "actor_labels": actor_labels,  # (K,) all zero
-            "valid_mask": valid_mask,      # (T, K)
-            "actions": s["actions"],       # (T-1, K)
+            "valid_mask": valid_mask,    # (T, K)
+            "actions": s["actions"],     # (T-1, K)
             "num_actors": s["num_actors"],
         }
+        if camera_params is not None:
+            result["camera_params"] = camera_params  # (T-1, 4)
+        return result
 
 
 def create_dataloaders(
