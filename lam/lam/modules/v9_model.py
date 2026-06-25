@@ -238,8 +238,10 @@ class LatentActionModelV9(nn.Module):
             z_dec = torch.cat([z_actor_dec, z_app], dim=-1)  # (B, T-1, K, z_dim + z_app_dim)
             z_dec_flat = z_dec.reshape(B * T1 * K, -1)
 
+            # Also detach z_bg from recon to fully isolate V8 encoder
             if z_bg is not None:
-                z_bg_flat = z_bg.unsqueeze(2).expand(-1, -1, K, -1).reshape(B * T1 * K, -1)
+                z_bg_for_recon = z_bg.detach() if self.detach_z_actor_recon else z_bg
+                z_bg_flat = z_bg_for_recon.unsqueeze(2).expand(-1, -1, K, -1).reshape(B * T1 * K, -1)
             else:
                 z_bg_flat = torch.zeros(B * T1 * K, 0, device=z_actor.device)
 
