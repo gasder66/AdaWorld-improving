@@ -1,0 +1,19 @@
+{
+  "name": "v9c_yolo",
+  "variant": "C",
+  "n_samples": 86,
+  "overall_nmi": 0.3374,
+  "overall_ari": 0.123,
+  "actor_leakage_acc": 0.8889,
+  "action_probe_acc": 0.8333,
+  "psnr_recon": 17.24,
+  "psnr_copy": 16.9,
+  "psnr_z0": 18.01,
+  "psnr_zshuffle": 17.72,
+  "ssim_recon": 0.6321,
+  "ssim_copy": 0.6079,
+  "delta_psnr_z0": -0.77,
+  "delta_psnr_zshuffle": -0.48,
+  "delta_psnr_copy": 0.34,
+  "go_verdict": "NO-GO"
+}
