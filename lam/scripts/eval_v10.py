@@ -204,8 +204,9 @@ def main():
         reducer = umap.UMAP(random_state=args.seed, n_neighbors=30, min_dist=0.3)
         z_2d = reducer.fit_transform(z_actor)
 
-        # 5 张图: action / slot / KMeans / actor_type / actor-action
-        fig, axes = plt.subplots(1, 5, figsize=(35, 6))
+        # 4 张图: action / slot / KMeans / actor-action
+        # 注: 合成数据中 slot 与 actor_type 一一对应, 故不单独画 actor_type
+        fig, axes = plt.subplots(1, 4, figsize=(28, 6))
 
         # 1. Color by action
         scatter1 = axes[0].scatter(z_2d[:, 0], z_2d[:, 1], c=actions, cmap="tab10",
@@ -232,26 +233,14 @@ def main():
         axes[2].set_title(f"Color=KMeans (NMI={nmi_overall:.3f})")
         axes[2].legend(*scatter3.legend_elements(), title="cluster", loc="best", fontsize=8)
 
-        # 4. Color by actor type (shape+color)
-        unique_types = np.unique(actor_types)
-        type_to_int = {t: i for i, t in enumerate(unique_types)}
-        type_ints = np.array([type_to_int[t] for t in actor_types])
-        scatter4 = axes[3].scatter(z_2d[:, 0], z_2d[:, 1], c=type_ints, cmap="Set2",
-                                    s=8, alpha=0.6)
-        axes[3].set_title(f"Color=Actor Type ({len(unique_types)} types)")
-        legend4 = axes[3].legend(*scatter4.legend_elements(),
-                                 title="actor", loc="best", fontsize=7)
-        for t, name in zip(legend4.get_texts(), unique_types[:len(legend4.get_texts())]):
-            t.set_text(name)
-
-        # 5. Color by actor-action composite
+        # 4. Color by actor-action composite (4 actors × 5 actions = 20 classes)
         unique_aa = np.unique(actor_action_labels)
         aa_to_int = {t: i for i, t in enumerate(unique_aa)}
         aa_ints = np.array([aa_to_int[t] for t in actor_action_labels])
-        scatter5 = axes[4].scatter(z_2d[:, 0], z_2d[:, 1], c=aa_ints, cmap="tab20",
+        scatter5 = axes[3].scatter(z_2d[:, 0], z_2d[:, 1], c=aa_ints, cmap="tab20",
                                     s=6, alpha=0.5)
-        axes[4].set_title(f"Color=Actor+Action ({len(unique_aa)} classes)")
-        axes[4].legend(*scatter5.legend_elements(),
+        axes[3].set_title(f"Color=Actor+Action ({len(unique_aa)} classes)")
+        axes[3].legend(*scatter5.legend_elements(),
                        title="actor-action", loc="best", fontsize=6,
                        ncol=2)
 
@@ -261,7 +250,6 @@ def main():
         plt.close()
         print(f"\n  UMAP saved: {umap_path}")
         results["umap_path"] = umap_path
-        results["n_actor_types"] = len(unique_types)
         results["n_actor_action_classes"] = len(unique_aa)
     except ImportError:
         print("\n  (umap-learn not installed, skipping visualization)")
