@@ -1,0 +1,22 @@
+{
+  "architecture": "v10_shared_vae",
+  "name": "v10_stage1",
+  "total_params": 9975552,
+  "training_steps": 5000,
+  "training_time_s": 1068.406733751297,
+  "peak_memory_gb": 2.46,
+  "n_eval_samples": 5832,
+  "overall_nmi": 0.2173,
+  "overall_ari": 0.1351,
+  "per_slot_nmi_avg": 0.718,
+  "per_slot_nmi": [
+    0.7054,
+    0.7309,
+    0.7318,
+    0.704
+  ],
+  "actor_leakage_acc": 0.9966,
+  "action_probe_acc": 0.856,
+  "full_frame_psnr": 25.03,
+  "z_actor_variance": 1.1812
+}
