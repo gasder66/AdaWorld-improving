@@ -181,6 +181,20 @@ def main():
     results["action_probe_given_slot"] = [round(float(x), 4) for x in act_probe_per]
 
     # === 6. UMAP Visualization ===
+    # 合成数据 actor 类型 (slot → 形状+颜色):
+    #   slot 0 = 红色方块, slot 1 = 绿色圆形, slot 2 = 蓝色三角, slot 3 = 黄色方块
+    SHAPE_NAMES = ["Square", "Circle", "Triangle"]
+    COLOR_NAMES = ["Red", "Green", "Blue", "Yellow", "Purple"]
+    ACTOR_TYPES = []
+    for s in slots:
+        shape = SHAPE_NAMES[int(s) % 3]
+        color = COLOR_NAMES[int(s) % 5]
+        ACTOR_TYPES.append(f"{color} {shape}")
+    actor_types = np.array(ACTOR_TYPES)
+
+    # actor-action 复合标签 (e.g. "Red Square-Left")
+    actor_action_labels = np.array([f"{t}-{a}" for t, a in zip(ACTOR_TYPES, actions)])
+
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -190,25 +204,56 @@ def main():
         reducer = umap.UMAP(random_state=args.seed, n_neighbors=30, min_dist=0.3)
         z_2d = reducer.fit_transform(z_actor)
 
-        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+        # 5 张图: action / slot / KMeans / actor_type / actor-action
+        fig, axes = plt.subplots(1, 5, figsize=(35, 6))
 
-        # Color by action
+        # 1. Color by action
         scatter1 = axes[0].scatter(z_2d[:, 0], z_2d[:, 1], c=actions, cmap="tab10",
                                     s=8, alpha=0.6)
-        axes[0].set_title(f"z UMAP (color=action, NMI={nmi_overall:.3f})")
-        axes[0].legend(*scatter1.legend_elements(), title="action", loc="best")
+        axes[0].set_title(f"Color=Action (NMI={nmi_overall:.3f})")
+        action_names = ["stay", "up", "down", "left", "right"]
+        legend1 = axes[0].legend(*scatter1.legend_elements(),
+                                 title="action", loc="best", fontsize=8)
+        for t, name in zip(legend1.get_texts(), action_names[:len(legend1.get_texts())]):
+            t.set_text(name)
 
-        # Color by slot
+        # 2. Color by slot
         scatter2 = axes[1].scatter(z_2d[:, 0], z_2d[:, 1], c=slots, cmap="Set1",
                                     s=8, alpha=0.6)
-        axes[1].set_title(f"z UMAP (color=slot, leakage={leakage:.3f})")
-        axes[1].legend(*scatter2.legend_elements(), title="slot", loc="best")
+        axes[1].set_title(f"Color=Slot (Leakage={leakage:.3f})")
+        legend2 = axes[1].legend(*scatter2.legend_elements(),
+                                 title="slot", loc="best", fontsize=8)
+        for t, name in zip(legend2.get_texts(), ACTOR_TYPES[:len(legend2.get_texts())]):
+            t.set_text(name)
 
-        # Color by KMeans cluster
+        # 3. Color by KMeans cluster
         scatter3 = axes[2].scatter(z_2d[:, 0], z_2d[:, 1], c=pred_all, cmap="tab10",
                                     s=8, alpha=0.6)
-        axes[2].set_title(f"z UMAP (color=KMeans, NMI={nmi_overall:.3f})")
-        axes[2].legend(*scatter3.legend_elements(), title="cluster", loc="best")
+        axes[2].set_title(f"Color=KMeans (NMI={nmi_overall:.3f})")
+        axes[2].legend(*scatter3.legend_elements(), title="cluster", loc="best", fontsize=8)
+
+        # 4. Color by actor type (shape+color)
+        unique_types = np.unique(actor_types)
+        type_to_int = {t: i for i, t in enumerate(unique_types)}
+        type_ints = np.array([type_to_int[t] for t in actor_types])
+        scatter4 = axes[3].scatter(z_2d[:, 0], z_2d[:, 1], c=type_ints, cmap="Set2",
+                                    s=8, alpha=0.6)
+        axes[3].set_title(f"Color=Actor Type ({len(unique_types)} types)")
+        legend4 = axes[3].legend(*scatter4.legend_elements(),
+                                 title="actor", loc="best", fontsize=7)
+        for t, name in zip(legend4.get_texts(), unique_types[:len(legend4.get_texts())]):
+            t.set_text(name)
+
+        # 5. Color by actor-action composite
+        unique_aa = np.unique(actor_action_labels)
+        aa_to_int = {t: i for i, t in enumerate(unique_aa)}
+        aa_ints = np.array([aa_to_int[t] for t in actor_action_labels])
+        scatter5 = axes[4].scatter(z_2d[:, 0], z_2d[:, 1], c=aa_ints, cmap="tab20",
+                                    s=6, alpha=0.5)
+        axes[4].set_title(f"Color=Actor+Action ({len(unique_aa)} classes)")
+        axes[4].legend(*scatter5.legend_elements(),
+                       title="actor-action", loc="best", fontsize=6,
+                       ncol=2)
 
         plt.tight_layout()
         umap_path = os.path.join(RESULTS_DIR, f"umap_{args.name}.png")
@@ -216,6 +261,8 @@ def main():
         plt.close()
         print(f"\n  UMAP saved: {umap_path}")
         results["umap_path"] = umap_path
+        results["n_actor_types"] = len(unique_types)
+        results["n_actor_action_classes"] = len(unique_aa)
     except ImportError:
         print("\n  (umap-learn not installed, skipping visualization)")
 

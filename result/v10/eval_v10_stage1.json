@@ -20,6 +20,8 @@
     0.8824
   ],
   "umap_path": "/home/xiaojy/projects/AdaWorld-improving/lam/scripts/../../result/v10/umap_v10_stage1.png",
+  "n_actor_types": 4,
+  "n_actor_action_classes": 20,
   "full_frame_psnr": 25.38,
   "actor_masked_psnr": 22.63,
   "copy_psnr": 14.85,
