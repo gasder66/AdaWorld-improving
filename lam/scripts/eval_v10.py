@@ -149,28 +149,36 @@ def main():
     print(f"  z → action acc = {act_acc:.4f}  (chance = {act_chance:.4f})")
     results["action_probe_acc"] = round(float(act_acc), 4)
 
-    # === 5. Conditional NMI (核心新指标) ===
-    # 合成数据中 slot 0..3 对应不同 actor (不同形状/颜色)
-    # 给定 slot 后, z 还能提供多少 action 信息?
-    print(f"\n[Conditional NMI (given slot)]")
-    nmi_conditional = []
+    # === 5. Action Probe given Slot (有监督条件指标) ===
+    # 与 Per-Slot NMI 的区别:
+    #   Per-Slot NMI = 无监督 (KMeans 在每个 slot 内聚类, 再比 GT action)
+    #   Action Probe given Slot = 有监督 (在每个 slot 内训练 action 分类器)
+    # 有监督指标更直接衡量 "z 中可线性解码的 action 信息"
+    print(f"\n[Action Probe given Slot]")
+    act_probe_per = []
     for k in np.unique(slots):
         idx = slots == k
         if idx.sum() < 50:
             continue
-        km_k = KMeans(n_clusters=args.n_clusters, random_state=args.seed, n_init=10)
-        pred_k = km_k.fit_predict(z_actor[idx])
-        nmi_k = normalized_mutual_info_score(actions[idx], pred_k)
-        nmi_conditional.append(nmi_k)
-    nmi_cond_avg = float(np.mean(nmi_conditional)) if nmi_conditional else 0.0
-    print(f"  Avg Conditional NMI = {nmi_cond_avg:.4f}")
-    print(f"  Overall NMI = {nmi_overall:.4f}")
-    if nmi_cond_avg > nmi_overall:
-        print(f"  → Conditional > Overall: z 编码了超越 slot 的 action 信息 ✓")
+        n_k = idx.sum()
+        idx_perm_k = np.random.RandomState(args.seed).permutation(n_k)
+        n_tr_k = int(0.8 * n_k)
+        z_k = z_actor[idx]
+        a_k = actions[idx]
+        clf_k = LogisticRegression(max_iter=1000, C=1.0)
+        clf_k.fit(z_k[idx_perm_k[:n_tr_k]], a_k[idx_perm_k[:n_tr_k]])
+        acc_k = clf_k.score(z_k[idx_perm_k[n_tr_k:]], a_k[idx_perm_k[n_tr_k:]])
+        act_probe_per.append(acc_k)
+        print(f"  Slot {k}: acc = {acc_k:.4f} (n={n_k})")
+    act_probe_cond_avg = float(np.mean(act_probe_per)) if act_probe_per else 0.0
+    print(f"  Avg Action Probe (given slot) = {act_probe_cond_avg:.4f}")
+    print(f"  Overall Action Probe          = {act_acc:.4f}")
+    if act_probe_cond_avg > act_acc:
+        print(f"  → given slot > overall: z 在 slot 内有更强的 action 解码能力 ✓")
     else:
-        print(f"  → Conditional ≈ Overall: z 可能只编码了 slot 身份")
-    results["conditional_nmi_avg"] = round(nmi_cond_avg, 4)
-    results["conditional_nmi"] = [round(float(x), 4) for x in nmi_conditional]
+        print(f"  → given slot ≈ overall: slot 信息对 action 解码帮助不大")
+    results["action_probe_given_slot_avg"] = round(act_probe_cond_avg, 4)
+    results["action_probe_given_slot"] = [round(float(x), 4) for x in act_probe_per]
 
     # === 6. UMAP Visualization ===
     try:
@@ -290,10 +298,10 @@ def main():
     print(f"{'Metric':<30} {'V6c':>10} {'V10':>10} {'V8':>10}")
     print(f"{'-'*60}")
     print(f"{'Overall NMI':<30} {'0.0525':>10} {nmi_overall:>10.4f} {'0.7723':>10}")
-    print(f"{'Per-Slot NMI (avg)':<30} {'0.3885':>10} {nmi_per_avg:>10.4f} {'0.7684':>10}")
+    print(f"{'Per-Slot NMI (avg, unsupervised)':<30} {'0.3885':>10} {nmi_per_avg:>10.4f} {'0.7684':>10}")
     print(f"{'Actor Leakage':<30} {'1.0000':>10} {leakage:>10.4f} {'0.3350':>10}")
-    print(f"{'Action Probe':<30} {'N/A':>10} {act_acc:>10.4f} {'0.8741':>10}")
-    print(f"{'Conditional NMI':<30} {'N/A':>10} {nmi_cond_avg:>10.4f} {'N/A':>10}")
+    print(f"{'Action Probe (supervised)':<30} {'N/A':>10} {act_acc:>10.4f} {'0.8741':>10}")
+    print(f"{'Action Probe given Slot':<30} {'N/A':>10} {act_probe_cond_avg:>10.4f} {'N/A':>10}")
     print(f"{'Full-frame PSNR (dB)':<30} {'27.35':>10} {psnr_recon:>10.2f} {'NO-GO':>10}")
     print(f"{'Actor-masked PSNR (dB)':<30} {'N/A':>10} {psnr_masked:>10.2f} {'N/A':>10}")
     print(f"{'Copy baseline PSNR (dB)':<30} {'N/A':>10} {psnr_copy:>10.2f} {'22.68':>10}")

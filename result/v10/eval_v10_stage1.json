@@ -12,12 +12,12 @@
   "per_slot_nmi_avg": 0.718,
   "actor_leakage_acc": 0.9966,
   "action_probe_acc": 0.856,
-  "conditional_nmi_avg": 0.718,
-  "conditional_nmi": [
-    0.7054,
-    0.7309,
-    0.7318,
-    0.704
+  "action_probe_given_slot_avg": 0.8549,
+  "action_probe_given_slot": [
+    0.8516,
+    0.8568,
+    0.8289,
+    0.8824
   ],
   "umap_path": "/home/xiaojy/projects/AdaWorld-improving/lam/scripts/../../result/v10/umap_v10_stage1.png",
   "full_frame_psnr": 25.38,
