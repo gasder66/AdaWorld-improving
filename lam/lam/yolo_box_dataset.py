@@ -325,9 +325,24 @@ class YOLOBoxDataset(Dataset):
         actions_tensor = torch.from_numpy(actions_out)
         num_actors = int(slot_valid[0].sum())
 
+        H = W = self.img_size
+        masks = torch.zeros(T, K, H, W, dtype=torch.float32)
+        for t in range(T):
+            for k in range(K):
+                if slot_valid[t, k]:
+                    x1 = int(slot_boxes[t, k, 0].round())
+                    y1 = int(slot_boxes[t, k, 1].round())
+                    x2 = int(slot_boxes[t, k, 2].round())
+                    y2 = int(slot_boxes[t, k, 3].round())
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(W, x2), min(H, y2)
+                    if x2 > x1 and y2 > y1:
+                        masks[t, k, y1:y2, x1:x2] = 1.0
+
         return {
             "videos": videos,
             "boxes": boxes,
+            "masks": masks,
             "track_ids": track_ids,
             "actor_labels": actor_labels,
             "valid_mask": valid_mask,
