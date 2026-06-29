@@ -19,6 +19,14 @@
     0.8289,
     0.8824
   ],
+  "leakage_given_action_avg": 0.9965,
+  "leakage_given_action": [
+    0.9911,
+    1.0,
+    1.0,
+    0.9958,
+    0.9958
+  ],
   "umap_path": "/home/xiaojy/projects/AdaWorld-improving/lam/scripts/../../result/v10/umap_v10_stage1.png",
   "n_actor_action_classes": 20,
   "full_frame_psnr": 25.38,

@@ -180,6 +180,48 @@ def main():
     results["action_probe_given_slot_avg"] = round(act_probe_cond_avg, 4)
     results["action_probe_given_slot"] = [round(float(x), 4) for x in act_probe_per]
 
+    # === 5b. Leakage given Action (对称指标) ===
+    # Action Probe 和 Actor Leakage 是同一方法论: Linear probe on z, 目标标签不同
+    # Action Probe: z → action      (z 包含多少 action 信息?)
+    # Leakage:      z → slot_id     (z 包含多少 actor 身份?)
+    # Leakage given Action: 给定动作, z → slot_id  (外观信息是否在动作内也被保留?)
+    print(f"\n[Leakage given Action]")
+    unique_actions_arr = np.unique(actions)
+    leak_per_action = []
+    for a in unique_actions_arr:
+        idx_a = actions == a
+        if idx_a.sum() < 50:
+            continue
+        n_a = idx_a.sum()
+        idx_perm_a = np.random.RandomState(args.seed).permutation(n_a)
+        n_tr_a = int(0.8 * n_a)
+        z_a = z_actor[idx_a]
+        s_a = slots[idx_a]
+        clf_a = LogisticRegression(max_iter=1000, C=1.0)
+        clf_a.fit(z_a[idx_perm_a[:n_tr_a]], s_a[idx_perm_a[:n_tr_a]])
+        acc_a = clf_a.score(z_a[idx_perm_a[n_tr_a:]], s_a[idx_perm_a[n_tr_a:]])
+        leak_per_action.append(acc_a)
+        action_names = ["stay", "up", "down", "left", "right"]
+        name = action_names[int(a)] if int(a) < len(action_names) else f"act{int(a)}"
+        print(f"  Action {int(a)}({name}): acc = {acc_a:.4f} (n={n_a})")
+    leak_given_action_avg = float(np.mean(leak_per_action)) if leak_per_action else 0.0
+    print(f"  Avg Leakage (given action) = {leak_given_action_avg:.4f}")
+    print(f"  Overall Leakage            = {leakage:.4f}")
+    if leak_given_action_avg > leakage:
+        print(f"  → 给定动作后, actor 身份更容易判断 (动作信息减少了 actor 混淆)")
+    else:
+        print(f"  → 给定动作 ≈ 不给定: actor 身份已经充分编码在 z 中")
+    results["leakage_given_action_avg"] = round(leak_given_action_avg, 4)
+    results["leakage_given_action"] = [round(float(x), 4) for x in leak_per_action]
+
+    # === 5c. 对称性总结 ===
+    print(f"\n[Probe 对称性总结]")
+    print(f"  {'':<30} {'z → action':>15} {'z → slot':>15}")
+    print(f"  {'Overall (无条件)':<30} {act_acc:>15.4f} {leakage:>15.4f}")
+    print(f"  {'Given Slot (条件化)':<30} {act_probe_cond_avg:>15.4f} {'N/A (slot=条件本身)':>15}")
+    print(f"  {'Given Action (条件化)':<30} {'N/A (action=条件本身)':>15} {leak_given_action_avg:>15.4f}")
+    print(f"  注: Action Probe 和 Leakage 是同一个方法论 (Linear probe), 目标标签不同")
+
     # === 6. UMAP Visualization ===
     # 合成数据 actor 类型 (slot → 形状+颜色):
     #   slot 0 = 红色方块, slot 1 = 绿色圆形, slot 2 = 蓝色三角, slot 3 = 黄色方块
@@ -335,6 +377,7 @@ def main():
     print(f"{'Overall NMI':<30} {'0.0525':>10} {nmi_overall:>10.4f} {'0.7723':>10}")
     print(f"{'Per-Slot NMI (avg, unsupervised)':<30} {'0.3885':>10} {nmi_per_avg:>10.4f} {'0.7684':>10}")
     print(f"{'Actor Leakage':<30} {'1.0000':>10} {leakage:>10.4f} {'0.3350':>10}")
+    print(f"{'Leakage given Action':<30} {'N/A':>10} {leak_given_action_avg:>10.4f} {'N/A':>10}")
     print(f"{'Action Probe (supervised)':<30} {'N/A':>10} {act_acc:>10.4f} {'0.8741':>10}")
     print(f"{'Action Probe given Slot':<30} {'N/A':>10} {act_probe_cond_avg:>10.4f} {'N/A':>10}")
     print(f"{'Full-frame PSNR (dB)':<30} {'27.35':>10} {psnr_recon:>10.2f} {'NO-GO':>10}")
