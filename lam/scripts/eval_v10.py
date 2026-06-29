@@ -1,0 +1,309 @@
+"""
+V10 评估: 聚类质量 + 重建质量 + Conditional NMI + Actor-masked PSNR.
+
+指标:
+  1. Overall NMI / ARI / Per-Slot NMI / Actor Leakage (同 V6c/V8 eval)
+  2. Conditional NMI: 给定 actor 类型后的 action NMI
+  3. Action Probe given Type: 每个 actor 类型内部 action 分类
+  4. Actor-masked PSNR: 只在 actor mask 区域计算
+  5. Copy baseline PSNR: PSNR(crop_t, crop_{t+1}) 作为参考
+  6. UMAP 可视化 (action / actor_type / KMeans / conditional)
+
+用法:
+  PYTHONPATH=lam python lam/scripts/eval_v10.py --name v10_stage1 --gpu 0
+"""
+import os, sys, json, argparse
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
+
+from lam.modules.v10_model import LatentActionModelV10
+from lam.disk_synthetic_dataset import DiskSyntheticDataset
+from lam.modules.blocks import patchify, unpatchify
+
+
+def compute_psnr(pred, target):
+    mse = F.mse_loss(pred, target)
+    if mse.item() < 1e-10:
+        return 100.0
+    return float(10 * torch.log10(1.0 / mse))
+
+
+def compute_masked_psnr(pred, target, mask):
+    """Actor-masked PSNR: 只在 mask 区域计算."""
+    # pred, target: (B, T-1, H, W, C), mask: (B, T-1, K, H, W)
+    # 合并所有 actor 的 mask
+    mask_union = mask.sum(dim=2)  # (B, T-1, H, W)
+    mask_union = mask_union.clamp(0, 1).unsqueeze(-1)  # (B, T-1, H, W, 1)
+    mask_exp = mask_union.expand_as(pred)
+
+    mse = ((pred - target) ** 2 * mask_exp).sum() / (mask_exp.sum() + 1e-8)
+    if mse.item() < 1e-10:
+        return 100.0
+    return float(10 * torch.log10(1.0 / mse))
+
+
+def compute_copy_psnr(videos):
+    """Copy baseline: PSNR(crop_t, crop_{t+1}) = PSNR(videos[:,:-1], videos[:,1:])."""
+    pred = videos[:, :-1]
+    target = videos[:, 1:]
+    return compute_psnr(pred, target)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", type=str, required=True)
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--n_clusters", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data_root", type=str, default=None)
+    parser.add_argument("--num_frames", type=int, default=5)
+    parser.add_argument("--max_actors", type=int, default=4)
+    args = parser.parse_args()
+
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+
+    RESULTS_DIR = os.path.join(
+        os.path.dirname(__file__), "..", "..", "result", "v10"
+    )
+
+    # Load training results for model config
+    results_path = os.path.join(RESULTS_DIR, f"results_{args.name}.json")
+    with open(results_path) as f:
+        train_results = json.load(f)
+
+    # Load latents
+    latents_path = os.path.join(RESULTS_DIR, f"latents_{args.name}.npz")
+    data = np.load(latents_path)
+    z_actor = data["z_actor"]       # (N, D) — actor slots only (bg excluded)
+    slots = data["slots"]           # (N,) slot index 0..3
+    actions = data["actions"]       # (N,) action 0..4
+
+    print(f"\n{'='*60}")
+    print(f"V10 Evaluation: {args.name}")
+    print(f"  Samples: {len(z_actor)}")
+    print(f"  z_actor: {z_actor.shape}")
+    print(f"  Actions: {np.unique(actions, return_counts=True)}")
+    print(f"  Slots:   {np.unique(slots, return_counts=True)}")
+    print(f"{'='*60}")
+
+    results = {
+        "model": f"V10 ({args.name})",
+        "n_samples": int(len(z_actor)),
+    }
+
+    # === 1. Overall NMI / ARI ===
+    km = KMeans(n_clusters=args.n_clusters, random_state=args.seed, n_init=10)
+    pred_all = km.fit_predict(z_actor)
+    nmi_overall = normalized_mutual_info_score(actions, pred_all)
+    ari_overall = adjusted_rand_score(actions, pred_all)
+    print(f"\n[Overall Clustering]")
+    print(f"  NMI = {nmi_overall:.4f}  (V6c: 0.0525, V8: 0.7723)")
+    print(f"  ARI = {ari_overall:.4f}")
+    results["overall_nmi"] = round(float(nmi_overall), 4)
+    results["overall_ari"] = round(float(ari_overall), 4)
+
+    # === 2. Per-Slot NMI ===
+    print(f"\n[Per-Slot NMI]")
+    nmi_per = []
+    for k in np.unique(slots):
+        idx = slots == k
+        if idx.sum() < 50:
+            continue
+        km_k = KMeans(n_clusters=args.n_clusters, random_state=args.seed, n_init=10)
+        pred_k = km_k.fit_predict(z_actor[idx])
+        nmi_k = normalized_mutual_info_score(actions[idx], pred_k)
+        nmi_per.append(nmi_k)
+        print(f"  Slot {k}: NMI = {nmi_k:.4f} (n={idx.sum()})")
+    nmi_per_avg = float(np.mean(nmi_per)) if nmi_per else 0.0
+    print(f"  Avg: NMI = {nmi_per_avg:.4f}  (V6c: 0.3885)")
+    results["per_slot_nmi"] = [round(float(x), 4) for x in nmi_per]
+    results["per_slot_nmi_avg"] = round(nmi_per_avg, 4)
+
+    # === 3. Actor Leakage ===
+    n_slots = len(np.unique(slots))
+    chance = 1.0 / n_slots
+    clf = LogisticRegression(max_iter=1000, C=1.0)
+    n = len(z_actor)
+    idx_perm = np.random.RandomState(args.seed).permutation(n)
+    n_tr = int(0.8 * n)
+    clf.fit(z_actor[idx_perm[:n_tr]], slots[idx_perm[:n_tr]])
+    leakage = clf.score(z_actor[idx_perm[n_tr:]], slots[idx_perm[n_tr:]])
+    print(f"\n[Actor Leakage]")
+    print(f"  z → slot_id acc = {leakage:.4f}  (chance = {chance:.4f})")
+    results["actor_leakage_acc"] = round(float(leakage), 4)
+
+    # === 4. Action Probe ===
+    clf_act = LogisticRegression(max_iter=1000, C=1.0)
+    clf_act.fit(z_actor[idx_perm[:n_tr]], actions[idx_perm[:n_tr]])
+    act_acc = clf_act.score(z_actor[idx_perm[n_tr:]], actions[idx_perm[n_tr:]])
+    act_chance = 1.0 / args.n_clusters
+    print(f"\n[Action Probe]")
+    print(f"  z → action acc = {act_acc:.4f}  (chance = {act_chance:.4f})")
+    results["action_probe_acc"] = round(float(act_acc), 4)
+
+    # === 5. Conditional NMI (核心新指标) ===
+    # 合成数据中 slot 0..3 对应不同 actor (不同形状/颜色)
+    # 给定 slot 后, z 还能提供多少 action 信息?
+    print(f"\n[Conditional NMI (given slot)]")
+    nmi_conditional = []
+    for k in np.unique(slots):
+        idx = slots == k
+        if idx.sum() < 50:
+            continue
+        km_k = KMeans(n_clusters=args.n_clusters, random_state=args.seed, n_init=10)
+        pred_k = km_k.fit_predict(z_actor[idx])
+        nmi_k = normalized_mutual_info_score(actions[idx], pred_k)
+        nmi_conditional.append(nmi_k)
+    nmi_cond_avg = float(np.mean(nmi_conditional)) if nmi_conditional else 0.0
+    print(f"  Avg Conditional NMI = {nmi_cond_avg:.4f}")
+    print(f"  Overall NMI = {nmi_overall:.4f}")
+    if nmi_cond_avg > nmi_overall:
+        print(f"  → Conditional > Overall: z 编码了超越 slot 的 action 信息 ✓")
+    else:
+        print(f"  → Conditional ≈ Overall: z 可能只编码了 slot 身份")
+    results["conditional_nmi_avg"] = round(nmi_cond_avg, 4)
+    results["conditional_nmi"] = [round(float(x), 4) for x in nmi_conditional]
+
+    # === 6. UMAP Visualization ===
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import umap
+
+        reducer = umap.UMAP(random_state=args.seed, n_neighbors=30, min_dist=0.3)
+        z_2d = reducer.fit_transform(z_actor)
+
+        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+
+        # Color by action
+        scatter1 = axes[0].scatter(z_2d[:, 0], z_2d[:, 1], c=actions, cmap="tab10",
+                                    s=8, alpha=0.6)
+        axes[0].set_title(f"z UMAP (color=action, NMI={nmi_overall:.3f})")
+        axes[0].legend(*scatter1.legend_elements(), title="action", loc="best")
+
+        # Color by slot
+        scatter2 = axes[1].scatter(z_2d[:, 0], z_2d[:, 1], c=slots, cmap="Set1",
+                                    s=8, alpha=0.6)
+        axes[1].set_title(f"z UMAP (color=slot, leakage={leakage:.3f})")
+        axes[1].legend(*scatter2.legend_elements(), title="slot", loc="best")
+
+        # Color by KMeans cluster
+        scatter3 = axes[2].scatter(z_2d[:, 0], z_2d[:, 1], c=pred_all, cmap="tab10",
+                                    s=8, alpha=0.6)
+        axes[2].set_title(f"z UMAP (color=KMeans, NMI={nmi_overall:.3f})")
+        axes[2].legend(*scatter3.legend_elements(), title="cluster", loc="best")
+
+        plt.tight_layout()
+        umap_path = os.path.join(RESULTS_DIR, f"umap_{args.name}.png")
+        plt.savefig(umap_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"\n  UMAP saved: {umap_path}")
+        results["umap_path"] = umap_path
+    except ImportError:
+        print("\n  (umap-learn not installed, skipping visualization)")
+
+    # === 7. Reconstruction: Full-frame + Actor-masked + Copy baseline ===
+    print(f"\n[Reconstruction]")
+
+    # Load model
+    model = LatentActionModelV10(
+        in_dim=3, model_dim=256, latent_dim=32, patch_size=16,
+        enc_blocks=4, dec_blocks=4, num_heads=8, max_actors=args.max_actors,
+        keep_background=True, use_obj_st_attention=True,
+        free_bits_lambda=0.1,
+    ).to(device)
+    model.load_state_dict(torch.load(
+        os.path.join(RESULTS_DIR, f"model_{args.name}.pt"), map_location=device
+    ))
+    model.eval()
+
+    if args.data_root is None:
+        data_root = os.path.join(
+            os.path.dirname(__file__), "..", "..", "data", "synthetic_multi_actor"
+        )
+    eval_ds = DiskSyntheticDataset(
+        os.path.join(data_root, "val"),
+        max_actors=args.max_actors, num_frames=args.num_frames,
+        output_format="t h w c",
+    )
+    eval_loader = torch.utils.data.DataLoader(eval_ds, batch_size=8, shuffle=False, num_workers=0)
+
+    all_recon_psnr = []
+    all_masked_psnr = []
+    all_copy_psnr = []
+    n_batches = 0
+
+    with torch.no_grad():
+        for batch in eval_loader:
+            videos = batch["videos"].to(device)
+            masks = batch["masks"].to(device)
+            out = model({"videos": videos, "masks": masks})
+            recon = out["recon"]  # (B, T-1, H, W, C)
+            gt = videos[:, 1:]     # (B, T-1, H, W, C)
+
+            # Full-frame PSNR
+            psnr_full = compute_psnr(recon, gt)
+
+            # Actor-masked PSNR
+            masks_t1 = masks[:, 1:]  # (B, T-1, K, H, W)
+            psnr_masked = compute_masked_psnr(recon, gt, masks_t1)
+
+            # Copy baseline
+            psnr_copy = compute_psnr(videos[:, :-1], gt)
+
+            all_recon_psnr.append(psnr_full)
+            all_masked_psnr.append(psnr_masked)
+            all_copy_psnr.append(psnr_copy)
+            n_batches += 1
+            if n_batches >= 15:
+                break
+
+    psnr_recon = float(np.mean(all_recon_psnr))
+    psnr_masked = float(np.mean(all_masked_psnr))
+    psnr_copy = float(np.mean(all_copy_psnr))
+
+    print(f"  Full-frame PSNR:  {psnr_recon:.2f} dB  (V6c: 27.35)")
+    print(f"  Actor-masked PSNR: {psnr_masked:.2f} dB  (只在 actor mask 区域)")
+    print(f"  Copy baseline:    {psnr_copy:.2f} dB  (PSNR(crop_t, crop_{{t+1}}))")
+    print(f"  ΔPSNR(recon-copy): {psnr_recon - psnr_copy:+.2f} dB")
+    print(f"  ΔPSNR(masked-copy): {psnr_masked - psnr_copy:+.2f} dB")
+
+    results["full_frame_psnr"] = round(psnr_recon, 2)
+    results["actor_masked_psnr"] = round(psnr_masked, 2)
+    results["copy_psnr"] = round(psnr_copy, 2)
+    results["delta_psnr_recon_copy"] = round(psnr_recon - psnr_copy, 2)
+    results["delta_psnr_masked_copy"] = round(psnr_masked - psnr_copy, 2)
+
+    # === Comparison Table ===
+    print(f"\n{'='*80}")
+    print(f"Comparison: V6c vs V10 vs V8")
+    print(f"{'='*80}")
+    print(f"{'Metric':<30} {'V6c':>10} {'V10':>10} {'V8':>10}")
+    print(f"{'-'*60}")
+    print(f"{'Overall NMI':<30} {'0.0525':>10} {nmi_overall:>10.4f} {'0.7723':>10}")
+    print(f"{'Per-Slot NMI (avg)':<30} {'0.3885':>10} {nmi_per_avg:>10.4f} {'0.7684':>10}")
+    print(f"{'Actor Leakage':<30} {'1.0000':>10} {leakage:>10.4f} {'0.3350':>10}")
+    print(f"{'Action Probe':<30} {'N/A':>10} {act_acc:>10.4f} {'0.8741':>10}")
+    print(f"{'Conditional NMI':<30} {'N/A':>10} {nmi_cond_avg:>10.4f} {'N/A':>10}")
+    print(f"{'Full-frame PSNR (dB)':<30} {'27.35':>10} {psnr_recon:>10.2f} {'NO-GO':>10}")
+    print(f"{'Actor-masked PSNR (dB)':<30} {'N/A':>10} {psnr_masked:>10.2f} {'N/A':>10}")
+    print(f"{'Copy baseline PSNR (dB)':<30} {'N/A':>10} {psnr_copy:>10.2f} {'22.68':>10}")
+    print(f"{'='*60}")
+
+    out_path = os.path.join(RESULTS_DIR, f"eval_{args.name}.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\n  Results saved: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
