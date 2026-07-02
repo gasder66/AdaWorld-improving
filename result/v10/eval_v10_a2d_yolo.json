@@ -1,8 +1,0 @@
-{
-  "name": "v10_a2d_yolo_gt_eval",
-  "n": 214,
-  "nmi": 0.1319,
-  "action_probe": 0.3256,
-  "leakage": 0.7674,
-  "psnr": 15.79
-}

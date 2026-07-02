@@ -114,6 +114,7 @@ class MOTSlotDataset(Dataset):
 
         result = {
             "videos": videos,            # (T, H, W, 3)
+            "masks": s["masks"],         # (T, K, H, W) binary — actor masks for masked PSNR
             "boxes": boxes,              # (T, K, 4)
             "track_ids": track_ids,      # (K,)
             "actor_labels": actor_labels,  # (K,) all zero

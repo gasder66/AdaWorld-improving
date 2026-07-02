@@ -147,3 +147,16 @@ V9-A 同时达到了 V6c 的重建水平和 V8 的聚类水平。
 3. **recon_weight 扫描**: 测试 0.01, 0.1, 0.5, 1.0 对 NMI/PSNR 的影响
 4. **Per-Slot NMI 深入分析**: 检查为什么 Per-Slot NMI 在所有变体中一致
 5. **V9-A 作为 AdaWorld latent action**: 测试 V9-A 的 z_actor 是否适合 world model rollout
+
+V9-A 在真实 A2D 数据上 NO-GO。让我对比合成 vs 真实数据的结果：
+指标	V8 YOLO
+NMI	0.3118
+Leakage	0.5556
+PSNR(recon)	NO-GO
+Δ(z=0)	0.00
+Verdict	NO-GO
+关键问题：
+1. Leakage 上升到 0.78 — recon loss 在真实数据上推动了 actor 外观泄漏到 z_actor
+2. NMI 下降到 0.27 — 比 V8 YOLO (0.31) 还低
+3. z_actor 对重建贡献很弱 — Δ(z=0) 只有 +0.26 dB
+根因分析：真实视频的外观信息比合成数据复杂得多。recon loss 梯度推动 encoder 保留外观，但真实外观携带大量 actor identity 信息，导致 leakage 爆炸。
