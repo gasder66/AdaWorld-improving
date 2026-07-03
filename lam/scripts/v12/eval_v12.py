@@ -344,6 +344,108 @@ def _save_z_ablation_plot(ablation_results: Dict, out_path: str) -> None:
     plt.close(fig)
 
 
+# ============================== z-Action Swap / Replay ==============================
+
+def _save_action_swap_panel(
+    model: LatentActionModelV12,
+    batch_a: Dict, batch_b: Dict,
+    device: torch.device,
+    out_path: str,
+) -> None:
+    """z-action causal swap test.
+
+    content_A + z_B -> A's appearance, B's motion.
+    Rows: sample A, sample B.
+    Cols: I_t | GT I_{t+1} | Recon(normal z) | Recon(z=0) | Recon(swapped z).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    with torch.no_grad():
+        def _get_content_and_s(batch):
+            v = batch["videos"].to(device)
+            m = batch["masks"].to(device)
+            b = batch["bboxes"].to(device)
+            vi = batch["valid_mask"].to(device)
+            c_obj, c_bg = model.content_encoder(v[:, 0], m[:, 0], b[:, 0], vi[:, 0])
+            raw_s, _ = model.structure_extractor(m, b, vi)
+            s = model.structure_encoder(raw_s, vi)
+            return c_obj, c_bg, s, vi, v, m
+
+        c_obj_a, c_bg_a, s_a, valid_a, v_a, m_a = _get_content_and_s(batch_a)
+        c_obj_b, c_bg_b, s_b, valid_b, v_b, m_b = _get_content_and_s(batch_b)
+
+        s_t_a, s_tp1_a = s_a[:, :-1], s_a[:, 1:]
+        valid_t_a, valid_tp1_a = valid_a[:, :-1], valid_a[:, 1:]
+
+        s_t_b, s_tp1_b = s_b[:, :-1], s_b[:, 1:]
+        valid_t_b, valid_tp1_b = valid_b[:, :-1], valid_b[:, 1:]
+
+        if model.use_z and model.idm is not None:
+            z_a, _, _ = model.idm(s_t_a, s_tp1_a, valid_t_a)
+            z_b, _, _ = model.idm(s_t_b, s_tp1_b, valid_t_b)
+        else:
+            Bz, Tz, Kz, Dz = s_t_a.shape
+            z_a = torch.zeros(Bz, Tz, Kz, Dz, device=device)
+            z_b = z_a
+
+        z_zero = torch.zeros_like(z_a)
+
+        def _decode(c_obj, c_bg, s_t, z, valid_t, valid_tp1):
+            s_hat = model.fdm(s_t, z, valid_t)
+            return model.decoder(c_obj, c_bg, s_hat, valid_tp1)
+
+        recon_a_normal = _decode(c_obj_a, c_bg_a, s_t_a, z_a, valid_t_a, valid_tp1_a)
+        recon_a_zero   = _decode(c_obj_a, c_bg_a, s_t_a, z_zero, valid_t_a, valid_tp1_a)
+        recon_a_swap   = _decode(c_obj_a, c_bg_a, s_t_a, z_b, valid_t_a, valid_tp1_a)
+
+        recon_b_normal = _decode(c_obj_b, c_bg_b, s_t_b, z_b, valid_t_b, valid_tp1_b)
+        recon_b_zero   = _decode(c_obj_b, c_bg_b, s_t_b, z_zero, valid_t_b, valid_tp1_b)
+        recon_b_swap   = _decode(c_obj_b, c_bg_b, s_t_b, z_a, valid_t_b, valid_tp1_b)
+
+    B = min(2, v_a.shape[0])
+    T1 = recon_a_normal.shape[1]
+    n_cols = 5
+    n_rows = B * T1 * 2
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.5, n_rows * 2.5))
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+
+    for b_idx in range(B):
+        for t in range(T1):
+            row_a = (b_idx * T1 + t) * 2
+            row_b = row_a + 1
+
+            for row, (name, v, recon_normal, recon_zero, recon_swap) in [
+                (row_a, ("A", v_a, recon_a_normal, recon_a_zero, recon_a_swap)),
+                (row_b, ("B", v_b, recon_b_normal, recon_b_zero, recon_b_swap)),
+            ]:
+                i_t   = v[b_idx, t].cpu().clamp(0, 1)
+                gt    = v[b_idx, t + 1].cpu().clamp(0, 1)
+                r_n   = recon_normal[b_idx, t].cpu().clamp(0, 1)
+                r_z   = recon_zero[b_idx, t].cpu().clamp(0, 1)
+                r_sw  = recon_swap[b_idx, t].cpu().clamp(0, 1)
+
+                panels = [
+                    (i_t, f"{name}: I_t"),
+                    (gt, "GT I_{t+1}"),
+                    (r_n, "Recon(normal)"),
+                    (r_z, "Recon(z=0)"),
+                    (r_sw, f"Recon(z from {'B' if name=='A' else 'A'})"),
+                ]
+                for c, (img, title) in enumerate(panels):
+                    ax = axes[row, c]
+                    ax.imshow(img.numpy())
+                    ax.set_title(title, fontsize=6)
+                    ax.axis("off")
+
+    fig.tight_layout(pad=0.3)
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"  Saved action swap panel")
+
+
 # ============================== Tracking Overlay ==============================
 
 def _draw_rect(img: np.ndarray, box: np.ndarray, color: Tuple[int, int, int], label: str = "") -> None:
@@ -386,7 +488,9 @@ def _make_model(args, device: torch.device) -> LatentActionModelV12:
         struct_dim=args.struct_dim, latent_dim=args.latent_dim,
         dec_dim=args.dec_dim, patch_size=args.patch_size,
         dec_blocks=args.dec_blocks, free_bits=args.free_bits,
-
+        use_z=not args.no_z,
+        use_velocity=not args.no_velocity,
+        encoder_mode=args.encoder_mode,
     ).to(device)
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
@@ -421,11 +525,6 @@ def main() -> None:
     parser.add_argument("--max_latent", type=int, default=2000, help="max latent samples for clustering")
     parser.add_argument("--n_vis_samples", type=int, default=3, help="samples for reconstruction viz")
     parser.add_argument("--out_dir", default=None)
-    # V12.1 diagnostic flags (must match training)
-    parser.add_argument("--no_z", action="store_true")
-    parser.add_argument("--no_velocity", action="store_true")
-    parser.add_argument("--encoder_mode", type=str, default="bidirectional",
-                        choices=["bidirectional", "causal", "per_frame"])
     parser.add_argument("--seed", type=int, default=42)
     # Model dims (must match training)
     parser.add_argument("--image_size", type=int, default=256)
@@ -440,6 +539,11 @@ def main() -> None:
     parser.add_argument("--patch_size", type=int, default=16)
     parser.add_argument("--dec_blocks", type=int, default=4)
     parser.add_argument("--free_bits", type=float, default=0.05)
+    # V12.1 diagnostic flags (must match training)
+    parser.add_argument("--no_z", action="store_true")
+    parser.add_argument("--no_velocity", action="store_true")
+    parser.add_argument("--encoder_mode", type=str, default="bidirectional",
+                        choices=["bidirectional", "causal", "per_frame"])
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -488,6 +592,7 @@ def main() -> None:
     ablation_inertia_iou = []
     # Per-slot recon (first batch only for viz)
     first_batch = None
+    second_batch = None
     recon_per_slot_viz: Optional[Dict[int, torch.Tensor]] = None
     recon_normal_viz: Optional[torch.Tensor] = None
 
@@ -586,7 +691,9 @@ def main() -> None:
                     out_slot = model.forward_ablation(first_batch, z_mode="normal", slot_keep=k)
                     recon_per_slot_viz[k] = out_slot["recon"][:args.n_vis_samples].cpu()
 
-
+            # Save second batch for action-swap viz
+            if second_batch is None and batch_idx == 1:
+                second_batch = {k: v[:args.n_vis_samples].clone() for k, v in batch_input.items()}
 
             n_collected += B
             if args.max_batches > 0 and batch_idx + 1 >= args.max_batches:
@@ -673,7 +780,15 @@ def main() -> None:
             )
             print(f"  Saved per-slot reconstruction panel")
 
-
+    # --- Action swap / z replay ---
+    if first_batch is not None and second_batch is not None and model.use_z:
+        try:
+            _save_action_swap_panel(
+                model, first_batch, second_batch, device,
+                os.path.join(out_dir, "action_swap.png"),
+            )
+        except Exception as e:
+            print(f"  Warning: action swap failed: {e}")
 
     # --- Tracking overlay ---
     sample0 = dataset[0]
