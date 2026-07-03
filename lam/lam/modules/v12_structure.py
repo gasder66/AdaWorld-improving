@@ -17,6 +17,7 @@ from torch import Tensor
 def boxes_xyxy_to_cxcywh(boxes: Tensor) -> Tensor:
     """(B, T, K, 4) pixel xyxy -> normalized cxcywh in [0,1]."""
     x1, y1, x2, y2 = boxes.unbind(-1)
+    H = boxes.new_tensor(float(boxes.shape[-3]))  # not used; H/W passed explicitly
     return torch.stack([(x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1), (y2 - y1)], dim=-1)
 
 
@@ -59,10 +60,11 @@ class StructureExtractor(nn.Module):
     No RGB pixels are used.
     """
 
-    def __init__(self, mask_grid: int = 16, mask_feat_dim: int = 32):
+    def __init__(self, mask_grid: int = 16, mask_feat_dim: int = 32, use_velocity: bool = True):
         super().__init__()
         self.mask_grid = mask_grid
         self.mask_feat_dim = mask_feat_dim
+        self.use_velocity = use_velocity
         self.mask_compress = nn.Sequential(
             nn.Conv2d(1, 16, 3, stride=2, padding=1),
             nn.GELU(),
@@ -71,6 +73,13 @@ class StructureExtractor(nn.Module):
             nn.AdaptiveAvgPool2d((2, 2)),
         )
         self.mask_proj = nn.Linear(mask_feat_dim * 4, mask_feat_dim)
+
+    @property
+    def raw_dim(self) -> int:
+        d = 4 + 6 + self.mask_feat_dim  # bbox + moments + mask_feat
+        if self.use_velocity:
+            d += 4
+        return d
 
     def forward(
         self,
@@ -83,11 +92,6 @@ class StructureExtractor(nn.Module):
         # Normalized cxcywh boxes.
         cxcywh = _normalize_boxes(boxes, H, W)                    # (B, T, K, 4)
 
-        # Velocity (frame difference); last frame repeats.
-        velocity = torch.zeros_like(cxcywh)
-        velocity[:, :-1] = cxcywh[:, 1:] - cxcywh[:, :-1]
-        velocity[:, -1:] = velocity[:, -2:-1]
-
         # Mask moments.
         moments = _mask_moments(masks)                             # (B, T, K, 6)
 
@@ -99,7 +103,14 @@ class StructureExtractor(nn.Module):
         mask_feat = self.mask_proj(mask_feat)                     # (B*T*K, mask_feat_dim)
         mask_feat = mask_feat.reshape(B, T, K, self.mask_feat_dim)
 
-        raw_struct = torch.cat([cxcywh, velocity, moments, mask_feat], dim=-1)  # (B, T, K, D_raw)
+        parts = [cxcywh, moments, mask_feat]
+        if self.use_velocity:
+            velocity = torch.zeros_like(cxcywh)
+            velocity[:, :-1] = cxcywh[:, 1:] - cxcywh[:, :-1]
+            velocity[:, -1:] = velocity[:, -2:-1]
+            parts.insert(1, velocity)
+
+        raw_struct = torch.cat(parts, dim=-1)  # (B, T, K, D_raw)
 
         # Targets for structure loss (absolute values at each frame).
         mask_low_gt = mask_low.reshape(B, T, K, 1, self.mask_grid, self.mask_grid)
@@ -112,7 +123,13 @@ class StructureExtractor(nn.Module):
 
 
 class StructureEncoder(nn.Module):
-    """raw_struct (B,T,K,D_raw) -> s (B,T,K,D_s). No RGB."""
+    """raw_struct (B,T,K,D_raw) -> s (B,T,K,D_s). No RGB.
+
+    encoder_mode:
+      "bidirectional" — full temporal transformer (default, s_t sees all frames)
+      "causal"        — causal temporal transformer (s_t sees ≤ t)
+      "per_frame"     — per-frame MLP only, no temporal transformer
+    """
 
     def __init__(
         self,
@@ -122,22 +139,25 @@ class StructureEncoder(nn.Module):
         slot_layers: int = 1,
         heads: int = 4,
         dropout: float = 0.0,
+        encoder_mode: str = "bidirectional",
     ):
         super().__init__()
         self.struct_dim = struct_dim
+        self.encoder_mode = encoder_mode
         self.mlp = nn.Sequential(
             nn.LayerNorm(raw_dim),
             nn.Linear(raw_dim, 256),
             nn.GELU(),
             nn.Linear(256, struct_dim),
         )
-        # Temporal transformer (per object across time).
-        temp_layer = nn.TransformerEncoderLayer(
-            d_model=struct_dim, nhead=heads, dim_feedforward=struct_dim * 4,
-            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
-        )
-        self.temporal = nn.TransformerEncoder(temp_layer, num_layers=temporal_layers)
-        # Slot transformer (per frame across objects).
+        if encoder_mode in ("bidirectional", "causal"):
+            temp_layer = nn.TransformerEncoderLayer(
+                d_model=struct_dim, nhead=heads, dim_feedforward=struct_dim * 4,
+                dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+            )
+            self.temporal = nn.TransformerEncoder(temp_layer, num_layers=temporal_layers)
+        else:
+            self.temporal = None
         slot_layer = nn.TransformerEncoderLayer(
             d_model=struct_dim, nhead=heads, dim_feedforward=struct_dim * 4,
             dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
@@ -149,12 +169,18 @@ class StructureEncoder(nn.Module):
         B, T, K, _ = raw_struct.shape
         s = self.mlp(raw_struct)                                  # (B,T,K,D_s)
 
-        # Temporal attention per object: (B*K, T, D_s)
-        s = s.permute(0, 2, 1, 3).reshape(B * K, T, self.struct_dim)
-        s = self.temporal(s)
-        s = s.reshape(B, K, T, self.struct_dim).permute(0, 2, 1, 3)  # (B,T,K,D_s)
+        if self.temporal is not None:
+            s = s.permute(0, 2, 1, 3).reshape(B * K, T, self.struct_dim)
+            if self.encoder_mode == "causal":
+                mask = torch.triu(
+                    torch.full((T, T), float("-inf"), device=s.device, dtype=s.dtype),
+                    diagonal=1,
+                )
+                s = self.temporal(s, mask=mask)
+            else:
+                s = self.temporal(s)
+            s = s.reshape(B, K, T, self.struct_dim).permute(0, 2, 1, 3)
 
-        # Slot attention per frame: (B*T, K, D_s)
         s = s.reshape(B * T, K, self.struct_dim)
         pad = ~valid.reshape(B * T, K)
         s = self.slot(s, src_key_padding_mask=pad)

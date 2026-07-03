@@ -421,6 +421,11 @@ def main() -> None:
     parser.add_argument("--max_latent", type=int, default=2000, help="max latent samples for clustering")
     parser.add_argument("--n_vis_samples", type=int, default=3, help="samples for reconstruction viz")
     parser.add_argument("--out_dir", default=None)
+    # V12.1 diagnostic flags (must match training)
+    parser.add_argument("--no_z", action="store_true")
+    parser.add_argument("--no_velocity", action="store_true")
+    parser.add_argument("--encoder_mode", type=str, default="bidirectional",
+                        choices=["bidirectional", "causal", "per_frame"])
     parser.add_argument("--seed", type=int, default=42)
     # Model dims (must match training)
     parser.add_argument("--image_size", type=int, default=256)

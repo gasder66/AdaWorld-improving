@@ -73,6 +73,14 @@ def main():
     parser.add_argument("--checkpoint_every", type=int, default=500)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    # V12.1 diagnostic flags
+    parser.add_argument("--no_z", action="store_true",
+                        help="Experiment A: No-z FDM baseline (removes IDM)")
+    parser.add_argument("--no_velocity", action="store_true",
+                        help="Experiment B: Remove velocity from raw structure")
+    parser.add_argument("--encoder_mode", type=str, default="bidirectional",
+                        choices=["bidirectional", "causal", "per_frame"],
+                        help="Experiment C: StructureEncoder temporal mode")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -116,6 +124,9 @@ def main():
         struct_dim=args.struct_dim, latent_dim=args.latent_dim,
         dec_dim=args.dec_dim, patch_size=args.patch_size,
         dec_blocks=args.dec_blocks, free_bits=args.free_bits,
+        use_z=not args.no_z,
+        use_velocity=not args.no_velocity,
+        encoder_mode=args.encoder_mode,
     ).to(device)
 
     if args.checkpoint:
@@ -244,12 +255,15 @@ def main():
 
             if "pred_struct" in outputs:
                 # Box IoU: compare predicted bbox to GT bbox at t+1.
+                # Use GT bboxes directly from dataset (already pixel xyxy).
                 pred_bbox = outputs["pred_struct"]["bbox"].cpu()  # normalized cxcywh
                 gt_boxes = boxes[:, 1:].cpu().float()  # (B, T1, K, 4) pixel xyxy
                 B, T1, K, _ = gt_boxes.shape
                 H = W = args.image_size
+                # Normalize gt boxes to cxcywh.
                 gx1, gy1, gx2, gy2 = gt_boxes.unbind(-1)
                 gt_cxcywh = torch.stack([(gx1+gx2)/2/W, (gy1+gy2)/2/H, (gx2-gx1)/W, (gy2-gy1)/H], -1)
+                # Convert pred to xyxy for IoU.
                 pcx, pcy, pw, ph = pred_bbox.unbind(-1)
                 pred_xyxy = torch.stack([pcx-pw/2, pcy-ph/2, pcx+pw/2, pcy+ph/2], -1)
                 gcx, gcy, gw, gh = gt_cxcywh.unbind(-1)

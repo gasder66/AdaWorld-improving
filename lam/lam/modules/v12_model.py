@@ -48,7 +48,13 @@ def _dice_bce_loss(pred_logits: Tensor, target: Tensor, valid: Tensor) -> Tensor
 
 
 class LatentActionModelV12(nn.Module):
-    """Object-centric structure-action world model."""
+    """Object-centric structure-action world model.
+
+    Diagnostic flags (V12.1):
+      use_z=False     — No-z FDM baseline (Experiment A)
+      use_velocity=False — No-velocity structure (Experiment B)
+      encoder_mode="causal" | "per_frame" — Causal StructureEncoder (Experiment C)
+    """
 
     def __init__(
         self,
@@ -78,30 +84,42 @@ class LatentActionModelV12(nn.Module):
         # Loss
         free_bits: float = 0.05,
         dropout: float = 0.0,
+        # V12.1 diagnostic flags
+        use_z: bool = True,
+        use_velocity: bool = True,
+        encoder_mode: str = "bidirectional",
     ) -> None:
         super().__init__()
         self.image_size = image_size
         self.max_actors = max_actors
         self.latent_dim = latent_dim
         self.free_bits = free_bits
+        self.use_z = use_z
+        self.use_velocity = use_velocity
+        self.encoder_mode = encoder_mode
 
-        raw_dim = 4 + 4 + 6 + mask_feat_dim  # bbox + velocity + moments + mask_feat
+        raw_dim = 4 + (4 if use_velocity else 0) + 6 + mask_feat_dim
 
         self.content_encoder = ObjectContentEncoder(
             crop_size=crop_size, content_dim=content_dim, channels=content_channels,
         )
         self.structure_extractor = StructureExtractor(
             mask_grid=mask_grid, mask_feat_dim=mask_feat_dim,
+            use_velocity=use_velocity,
         )
         self.structure_encoder = StructureEncoder(
             raw_dim=raw_dim, struct_dim=struct_dim,
             temporal_layers=temporal_layers, slot_layers=slot_layers,
             heads=struct_heads, dropout=dropout,
+            encoder_mode=encoder_mode,
         )
-        self.idm = FactorizedIDM(
-            struct_dim=struct_dim, latent_dim=latent_dim,
-            layers=idm_layers, heads=dyn_heads, dropout=dropout,
-        )
+        if use_z:
+            self.idm = FactorizedIDM(
+                struct_dim=struct_dim, latent_dim=latent_dim,
+                layers=idm_layers, heads=dyn_heads, dropout=dropout,
+            )
+        else:
+            self.idm = None
         self.fdm = FactorizedFDM(
             struct_dim=struct_dim, latent_dim=latent_dim,
             layers=fdm_layers, heads=dyn_heads, dropout=dropout,
@@ -214,7 +232,14 @@ class LatentActionModelV12(nn.Module):
             return outputs
 
         # 3. Inverse dynamics: s_t, s_{t+1} -> z.
-        z, mu, logvar = self.idm(s_t, s_tp1, valid_t)
+        if self.use_z and self.idm is not None:
+            z, mu, logvar = self.idm(s_t, s_tp1, valid_t)
+        else:
+            # No-z baseline: z is zeros, no IDM, no KL.
+            Bz, Tz, Kz = s_t.shape[:3]
+            z = torch.zeros(Bz, Tz, Kz, self.latent_dim, device=s_t.device, dtype=s_t.dtype)
+            mu = z
+            logvar = -5.0 * torch.ones_like(z)
 
         # 4. Forward dynamics: s_t, z -> s_hat_{t+1}.
         s_hat = self.fdm(s_t, z, valid_t)
@@ -281,7 +306,12 @@ class LatentActionModelV12(nn.Module):
         s_t, s_tp1 = s[:, :-1], s[:, 1:]
         valid_t, valid_tp1 = valid[:, :-1], valid[:, 1:]
 
-        z, mu, logvar = self.idm(s_t, s_tp1, valid_t)
+        if self.use_z and self.idm is not None:
+            z, mu, logvar = self.idm(s_t, s_tp1, valid_t)
+        else:
+            Bz, Tz, Kz = s_t.shape[:3]
+            z = torch.zeros(Bz, Tz, Kz, self.latent_dim, device=s_t.device, dtype=s_t.dtype)
+            mu = z
 
         if z_mode == "zero":
             z = torch.zeros_like(z)
