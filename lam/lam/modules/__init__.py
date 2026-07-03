@@ -1,8 +1,9 @@
 """AdaWorld model modules.
 
-Active models (V10, V11):
+Active models (V10, V11, V12):
   - LatentActionModelV10: Shared VAE + RGB reconstruction
   - LatentActionModelV11: Frame-Diff LAM (iVideoGPT-style)
+  - LatentActionModelV12: Object-Centric Structure-Action World Model
 
 Archived (V3/V8/V9) — available via lam.modules._archived.*:
   - LatentActionModel (V3): Original slot competition LAM
@@ -14,6 +15,7 @@ Archived (V3/V8/V9) — available via lam.modules._archived.*:
 # Active models
 from lam.modules.v10_model import LatentActionModelV10
 from lam.modules.v11_model import LatentActionModelV11
+from lam.modules.v12_model import LatentActionModelV12
 
 # Building blocks
 from lam.modules.blocks import (

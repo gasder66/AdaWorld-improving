@@ -1,0 +1,53 @@
+model:
+  name: V12_oc_structure_action_wm
+  image_size: 256
+  max_actors: 4
+
+  content:
+    crop_size: 64
+    content_dim: 128
+    channels: [32, 64, 128]
+
+  structure:
+    mask_grid: 16
+    mask_feat_dim: 32
+    struct_dim: 128
+    temporal_layers: 2
+    slot_layers: 1
+    struct_heads: 4
+
+  latent_action:
+    dim: 16
+    free_bits: 0.05
+    beta_kl: 0.01
+    idm_layers: 2
+    fdm_layers: 2
+    dyn_heads: 4
+
+  decoder:
+    dec_dim: 256
+    patch_size: 16
+    dec_blocks: 4
+    dec_heads: 8
+
+loss:
+  lambda_struct: 1.0
+  lambda_recon: 0.1
+  lambda_box: 10.0
+  lambda_mask: 1.0
+  lambda_mom: 1.0
+  lambda_actor_masked: 2.0
+  beta_kl: 0.01
+
+train:
+  batch_size: 16
+  steps_phase_a: 3000
+  steps_phase_b: 5000
+  steps_phase_c: 5000
+  lr: 2.5e-4
+  optimizer: adamw
+  weight_decay: 1.0e-4
+  grad_clip: 0.3
+  checkpoint_every: 500
+  num_workers: 4
+  seed: 42
