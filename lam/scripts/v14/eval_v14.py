@@ -86,6 +86,100 @@ def _compute_warp_dices(pred_mask_warp, gt_mask, valid):
     return dices
 
 
+def _compute_dice_hard(pred, gt):
+    """Dice coefficient with hard threshold (>0.5)."""
+    pb = (pred > 0.5).float(); gb = gt.float()
+    inter = (pb * gb).sum(); denom = pb.sum() + gb.sum() + 1e-6
+    return float(2 * inter / denom)
+
+
+def _compute_dice_soft(pred, gt):
+    """Soft Dice coefficient (bilinear values)."""
+    p = pred.clamp(0, 1); g = gt.clamp(0, 1)
+    inter = (p * g).sum(); denom = p.sum() + g.sum() + 1e-6
+    return float(2 * inter / denom)
+
+
+def _compute_iou_hard(pred, gt):
+    """IoU with hard threshold."""
+    pb = (pred > 0.5).float(); gb = gt.float()
+    inter = (pb * gb).sum(); union = pb.sum() + gb.sum() - inter + 1e-6
+    return float(inter / union)
+
+
+def _per_slot_mask_dice_soft(pred, gt, valid, B, T, K):
+    """Soft Dice per slot, returns list of K lists."""
+    dices = [[] for _ in range(K)]
+    p = pred.clamp(0, 1)
+    for b in range(B):
+        for t in range(T):
+            for k in range(K):
+                if not valid[b, t, k]: continue
+                inter = (p[b, t, k] * gt[b, t, k].clamp(0, 1)).sum()
+                denom = p[b, t, k].sum() + gt[b, t, k].clamp(0, 1).sum() + 1e-6
+                dices[k].append(float(2 * inter / denom))
+    return dices
+
+
+def _per_slot_mask_dice_hard(pred, gt, valid, B, T, K):
+    """Hard Dice (>0.5) per slot."""
+    dices = [[] for _ in range(K)]
+    pb = (pred > 0.5).float(); gb = gt.float()
+    for b in range(B):
+        for t in range(T):
+            for k in range(K):
+                if not valid[b, t, k]: continue
+                inter = (pb[b, t, k] * gb[b, t, k]).sum()
+                denom = pb[b, t, k].sum() + gb[b, t, k].sum() + 1e-6
+                dices[k].append(float(2 * inter / denom))
+    return dices
+
+
+def _per_slot_dice_flat(pred, gt, valid, B, T, K, min_area=1.0):
+    """Flat list of per-slot soft Dice values, filtering empty masks."""
+    vals = []
+    p = pred.clamp(0, 1); g = gt.clamp(0, 1)
+    for b in range(B):
+        for t in range(T):
+            for k in range(K):
+                if not valid[b, t, k]: continue
+                if g[b, t, k].sum() < min_area: continue  # skip empty masks
+                inter = (p[b, t, k] * g[b, t, k]).sum()
+                denom = p[b, t, k].sum() + g[b, t, k].sum() + 1e-6
+                vals.append(float(2 * inter / denom))
+    return vals
+
+
+def _per_slot_dice_flat_hard(pred, gt, valid, B, T, K, min_area=1.0):
+    """Flat list of hard Dice values, filtering empty masks."""
+    vals = []
+    pb = (pred > 0.5).float(); gb = gt.float()
+    for b in range(B):
+        for t in range(T):
+            for k in range(K):
+                if not valid[b, t, k]: continue
+                if gb[b, t, k].sum() < min_area: continue
+                inter = (pb[b, t, k] * gb[b, t, k]).sum()
+                denom = pb[b, t, k].sum() + gb[b, t, k].sum() + 1e-6
+                vals.append(float(2 * inter / denom))
+    return vals
+
+
+def _per_slot_iou_hard(pred, gt, valid, B, T, K, min_area=1.0):
+    """Flat list of hard IoU values, filtering empty masks."""
+    vals = []
+    pb = (pred > 0.5).float(); gb = gt.float()
+    for b in range(B):
+        for t in range(T):
+            for k in range(K):
+                if not valid[b, t, k]: continue
+                if gb[b, t, k].sum() < min_area: continue
+                inter = (pb[b, t, k] * gb[b, t, k]).sum()
+                union = pb[b, t, k].sum() + gb[b, t, k].sum() - inter + 1e-6
+                vals.append(float(inter / union))
+    return vals
+
+
 def _classify_delta(dcx, dcy):
     ax, ay = abs(dcx), abs(dcy)
     if ax < 0.005 and ay < 0.005: return 0
@@ -306,6 +400,106 @@ def _save_swap_panel(model, batch_a, batch_b, device, out_path):
     fig.tight_layout(pad=0.3); fig.savefig(out_path, dpi=100); plt.close(fig)
 
 
+def _save_per_action_mask_dice(results, out_path):
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    per_action = results.get("oracle_per_action", {})
+    if not per_action: return
+    acts = sorted(per_action.keys(), key=lambda x: int(x))
+    labels = [ACTION_NAMES[int(a)] for a in acts]
+    x = np.arange(len(acts)); w = 0.25
+    fig, ax = plt.subplots(figsize=(10, 5))
+    vals_gt = [per_action[a].get("mask_gt_warp_dice_h", 0) for a in acts]
+    vals_n = [per_action[a].get("mask_pred_n_dice_h", 0) for a in acts]
+    vals_z = [per_action[a].get("mask_pred_z_dice_h", 0) for a in acts]
+    ax.bar(x - w, vals_gt, w, label="GT warp", color="#4CAF50")
+    ax.bar(x, vals_n, w, label="Pred normal", color="#2196F3")
+    ax.bar(x + w, vals_z, w, label="Pred z=0", color="#FF9800")
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylabel("Mask Dice (hard)"); ax.set_title("Per-Action Mask Dice")
+    ax.legend(fontsize=8)
+    for i in range(len(acts)):
+        ax.text(i - w, vals_gt[i] + 0.01, f"{vals_gt[i]:.2f}", ha="center", fontsize=6)
+        ax.text(i, vals_n[i] + 0.01, f"{vals_n[i]:.2f}", ha="center", fontsize=6)
+        ax.text(i + w, vals_z[i] + 0.01, f"{vals_z[i]:.2f}", ha="center", fontsize=6)
+    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
+
+
+def _save_mask_gap_breakdown(results, out_path):
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    filters = [("oracle_all", "All"), ("oracle_ns", "Non-stay"), ("oracle_cs", "Center-safe"),
+               ("oracle_cs_ns", "CS+NS")]
+    x = np.arange(len(filters)); w = 0.3
+    vals_n, vals_z = [], []
+    valid_filters = []
+    for fk, fn in filters:
+        if fk in results:
+            vals_n.append(results[fk].get("mask_pred_n_dice_h", 0))
+            vals_z.append(results[fk].get("mask_pred_z_dice_h", 0))
+            valid_filters.append(fn)
+    if not valid_filters: return
+    x_valid = np.arange(len(valid_filters))
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(x_valid - w/2, vals_n, w, label="Pred normal", color="#2196F3")
+    ax.bar(x_valid + w/2, vals_z, w, label="Pred z=0", color="#FF9800")
+    ax.set_xticks(x_valid); ax.set_xticklabels(valid_filters)
+    ax.set_ylabel("Mask Dice (hard)"); ax.set_title("Mask Gap Breakdown")
+    ax.legend(fontsize=8)
+    for i in range(len(valid_filters)):
+        ax.text(i - w/2, vals_n[i] + 0.01, f"{vals_n[i]:.2f}", ha="center", fontsize=6)
+        ax.text(i + w/2, vals_z[i] + 0.01, f"{vals_z[i]:.2f}", ha="center", fontsize=6)
+    fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
+
+
+def _save_mask_oracle_panel(batch, ab, device, model, out_path):
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    from lam.modules.v14_mask_warp import warp_mask_by_bbox
+
+    video = batch["video"]; masks = batch["masks"]; boxes = batch["boxes"]
+    valid = batch["valid"]; B, T, C, H, W = video.shape; K = boxes.shape[2]
+
+    mask_t = masks[:, :-1]; gt_mask_tp1 = masks[:, 1:]
+    bbox_t = boxes[:, :-1]; gt_bbox_tp1 = boxes[:, 1:]
+    valid_tp1 = valid[:, 1:]
+    B_T1 = B * (T - 1)
+    mask_t_flat = mask_t.reshape(B_T1, K, 1, H, W)
+    bbox_t_flat = bbox_t.reshape(B_T1, K, 4)
+
+    identity = warp_mask_by_bbox(mask_t_flat, bbox_t_flat, bbox_t_flat, out_size=H).reshape(B, T - 1, K, 1, H, W)
+    gt_warp = warp_mask_by_bbox(mask_t_flat, bbox_t_flat, gt_bbox_tp1.reshape(B_T1, K, 4), out_size=H).reshape(B, T - 1, K, 1, H, W)
+    pred_nm = warp_mask_by_bbox(mask_t_flat, bbox_t_flat, ab["n"]["pred_struct"]["bbox"].reshape(B_T1, K, 4), out_size=H).reshape(B, T - 1, K, 1, H, W)
+    pred_zm = warp_mask_by_bbox(mask_t_flat, bbox_t_flat, ab["z"]["pred_struct"]["bbox"].reshape(B_T1, K, 4), out_size=H).reshape(B, T - 1, K, 1, H, W)
+    pred_sm = warp_mask_by_bbox(mask_t_flat, bbox_t_flat, ab["s"]["pred_struct"]["bbox"].reshape(B_T1, K, 4), out_size=H).reshape(B, T - 1, K, 1, H, W)
+
+    n_cols, n_rows = 8, min(3, K)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.3, n_rows * 2.3))
+    if n_rows == 1: axes = axes[np.newaxis, :]
+    s_idx, t_idx = 0, 0
+
+    for k in range(n_rows):
+        if not valid_tp1[s_idx, t_idx, k]: continue
+        rgb = video[s_idx, t_idx].permute(1, 2, 0).cpu().clamp(0, 1)
+        mt = mask_t[s_idx, t_idx, k].cpu().numpy()
+        gm = gt_mask_tp1[s_idx, t_idx, k].cpu().numpy()
+        mi = identity[s_idx, t_idx, k, 0].cpu().clamp(0, 1).numpy()
+        gw = gt_warp[s_idx, t_idx, k, 0].cpu().clamp(0, 1).numpy()
+        pn = pred_nm[s_idx, t_idx, k, 0].cpu().clamp(0, 1).numpy()
+        pz = pred_zm[s_idx, t_idx, k, 0].cpu().clamp(0, 1).numpy()
+        ps = pred_sm[s_idx, t_idx, k, 0].cpu().clamp(0, 1).numpy()
+
+        for c, (img, ti) in enumerate([
+            (_to_rgb(rgb), "RGB_t"), (mt, "mask_t"), (gm, "GT t+1"),
+            (mi, "Identity"), (gw, "GT warp"), (pn, "Pred(n)"), (pz, "Pred(z)"), (ps, "Pred(s)"),
+        ]):
+            cmap = None if img.ndim == 3 else "Blues"; vrange = None if img.ndim == 3 else (0, 1)
+            axes[k, c].imshow(img, cmap=cmap, vmin=0, vmax=1)
+            axes[k, c].set_title(ti, fontsize=5); axes[k, c].axis("off")
+
+    fig.tight_layout(pad=0.2); fig.savefig(out_path, dpi=120); plt.close(fig)
+
+
+def _to_rgb(x): return x.cpu().clamp(0, 1).numpy() if hasattr(x, 'numpy') else x
+
+
 # ============================== Main ==============================
 
 def main():
@@ -316,6 +510,11 @@ def main():
     parser.add_argument("--max_batches", type=int, default=15)
     parser.add_argument("--max_latent", type=int, default=3000)
     parser.add_argument("--mask_eval_mode", default="warp", choices=["head", "warp"])
+    parser.add_argument("--mask_oracle", action="store_true",
+                        help="Enable identity/GT warp oracle diagnostics")
+    parser.add_argument("--output_dir", default=None, help="Override eval output dir")
+    parser.add_argument("--num_batches", type=int, default=None,
+                        help="Override max_batches (alias)")
     parser.add_argument("--out_dir", default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -325,7 +524,12 @@ def main():
 
     ROOT = os.path.join(os.path.dirname(__file__), "../../..")
     val_dir = os.path.join(ROOT, "data", "bridgebench", "bridge1", "val")
-    out_dir = args.out_dir or os.path.join(ROOT, "result", "v14", "bridge1", "eval")
+    # Output dir: --output_dir > --out_dir > default, with oracle suffix if applicable.
+    out_dir = (args.output_dir or args.out_dir or
+               os.path.join(ROOT, "result", "v14", "bridge1",
+                            "eval_v14_2" if args.mask_oracle else "eval"))
+    if args.num_batches is not None:
+        args.max_batches = args.num_batches
     _ensure_dir(out_dir)
 
     print(f"\n{'='*60}\nV14.1 Eval  ckpt={args.checkpoint}  mask_mode={args.mask_eval_mode}\n{'='*60}")
@@ -346,13 +550,44 @@ def main():
         for t in ["psnr", "obj_psnr"]:
             acc[f"{m}_{t}"] = []
     acc["copy_psnr"] = []
+    # Oracle accumulators (V14.2).
+    oracle = {} if args.mask_oracle else None
+    if oracle is not None:
+        for t in ["identity_dice_s", "identity_dice_h", "identity_iou_h",
+                  "gt_warp_dice_s", "gt_warp_dice_h", "gt_warp_iou_h"]:
+            oracle[t] = []
+        oracle["pred_warp_normal_dice_s"] = []
+        oracle["pred_warp_normal_dice_h"] = []
+        oracle["pred_warp_zero_dice_s"] = []
+        oracle["pred_warp_zero_dice_h"] = []
+        oracle["pred_warp_shuffle_dice_s"] = []
+        oracle["pred_warp_shuffle_dice_h"] = []
+        # Per-action.
+        oracle["per_action"] = {}
+        for a in range(5):
+            oracle["per_action"][a] = {
+                "bbox_n": [], "bbox_z": [], "bbox_s": [],
+                "mask_gt_warp_dice_s": [], "mask_pred_n_dice_s": [],
+                "mask_pred_z_dice_s": [], "mask_pred_s_dice_s": [],
+                "mask_gt_warp_dice_h": [], "mask_pred_n_dice_h": [],
+                "mask_pred_z_dice_h": [], "mask_pred_s_dice_h": [],
+                "count": 0,
+            }
+        # Center-safe accumulators.
+        for filt in ["all", "cs", "ns", "cs_ns"]:
+            oracle[filt] = {
+                "mask_gt_warp_dice_s": [], "mask_gt_warp_dice_h": [],
+                "mask_pred_n_dice_s": [], "mask_pred_n_dice_h": [],
+                "mask_pred_z_dice_s": [], "mask_pred_z_dice_h": [],
+                "bbox_n": [], "bbox_z": [],
+            }
     all_z, all_action, all_actor, all_cat = [], [], [], []
     swap_vals = {k: [] for k in [
         "acc_all", "acc_cs", "acc_ns", "acc_cs_ns",
         "eff_acc", "eff_iou", "eff_l1", "eff_acc_cs",
     ]}
     swap_count = 0
-    first_batch, first_n, first_z = None, None, None
+    first_batch, first_n, first_z, first_ab = None, None, None, None
 
     n_batches = min(args.max_batches, len(files) // args.batch_size)
 
@@ -417,6 +652,101 @@ def main():
             # Full-res mask warp Dice.
             dices_wf = _compute_warp_dices(mask_warp_full, gt_mask_tp1.unsqueeze(-3), valid_tp1)
             acc[f"{mode}_dice_warp"].extend(sum(dices_wf, []))
+
+        # --- Oracle diagnostics (V14.2) ---
+        if oracle is not None:
+            B_T1 = B * (T - 1)
+            mask_t_flat = mask_t.reshape(B_T1, K, 1, H, W)
+            bbox_t_flat = bbox_t.reshape(B_T1, K, 4)
+            gt_mask_5d = gt_mask_tp1.unsqueeze(-3)  # (B, T-1, K, 1, H, W)
+
+            # Identity warp: warp(mask_t, bbox_t, bbox_t) vs mask_t.
+            mask_identity = warp_mask_by_bbox(mask_t_flat, bbox_t_flat, bbox_t_flat,
+                                              out_size=H).reshape(B, T - 1, K, 1, H, W)
+            oracle["identity_dice_s"].extend(_per_slot_dice_flat(mask_identity, mask_t.unsqueeze(-3), valid_tp1, B, T - 1, K))
+            oracle["identity_dice_h"].extend(_per_slot_dice_flat_hard(mask_identity, mask_t.unsqueeze(-3), valid_tp1, B, T - 1, K))
+            identity_iou = _per_slot_iou_hard(mask_identity, mask_t.unsqueeze(-3), valid_tp1, B, T - 1, K)
+
+            # GT bbox warp oracle: warp(mask_t, bbox_t, gt_bbox_{t+1}) vs gt_mask_{t+1}.
+            gt_warp = warp_mask_by_bbox(mask_t_flat, bbox_t_flat,
+                                        gt_bbox.reshape(B_T1, K, 4),
+                                        out_size=H).reshape(B, T - 1, K, 1, H, W)
+            oracle["gt_warp_dice_s"].extend(_per_slot_dice_flat(gt_warp, gt_mask_5d, valid_tp1, B, T - 1, K))
+            oracle["gt_warp_dice_h"].extend(_per_slot_dice_flat_hard(gt_warp, gt_mask_5d, valid_tp1, B, T - 1, K))
+            oracle["gt_warp_iou_h"].extend(_per_slot_iou_hard(gt_warp, gt_mask_5d, valid_tp1, B, T - 1, K))
+
+            # Pred warp normal/zero/shuffle.
+            for mode_key, out in [("normal", ab["n"]), ("zero", ab["z"]), ("shuffle", ab["s"])]:
+                pw = warp_mask_by_bbox(mask_t_flat, bbox_t_flat,
+                                       out["pred_struct"]["bbox"].reshape(B_T1, K, 4),
+                                       out_size=H).reshape(B, T - 1, K, 1, H, W)
+                oracle[f"pred_warp_{mode_key}_dice_s"].extend(
+                    _per_slot_dice_flat(pw, gt_mask_5d, valid_tp1, B, T - 1, K))
+                oracle[f"pred_warp_{mode_key}_dice_h"].extend(
+                    _per_slot_dice_flat_hard(pw, gt_mask_5d, valid_tp1, B, T - 1, K))
+
+            # Per-action and center-safe breakdown.
+            actions_batch = batch["actions"].cpu().numpy()
+            for b in range(B):
+                for t in range(T - 1):
+                    for k in range(K):
+                        if not valid_tp1[b, t, k]: continue
+                        act = int(actions_batch[b, t, k])
+                        if act < 0 or act >= 5: continue
+                        pa = oracle["per_action"][act]
+                        pa["count"] += 1
+                        # Bbox normal/zero.
+                        bbox_n = ab["n"]["pred_struct"]["bbox"][b, t, k]
+                        bbox_z = ab["z"]["pred_struct"]["bbox"][b, t, k]
+                        bbox_s = ab["s"]["pred_struct"]["bbox"][b, t, k]
+                        gb = gt_bbox[b, t, k]
+                        for key, pb in [("bbox_n", bbox_n), ("bbox_z", bbox_z), ("bbox_s", bbox_s)]:
+                            pcx, pcy, pw_, ph_ = pb.tolist()
+                            gcx, gcy, gw_, gh_ = gb.tolist()
+                            px1 = pcx - pw_/2; py1 = pcy - ph_/2; px2 = pcx + pw_/2; py2 = pcy + ph_/2
+                            gx1 = gcx - gw_/2; gy1 = gcy - gh_/2; gx2 = gcx + gw_/2; gy2 = gcy + gh_/2
+                            ix1 = max(px1, gx1); iy1 = max(py1, gy1); ix2 = min(px2, gx2); iy2 = min(py2, gy2)
+                            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                            ap = max(0, px2 - px1) * max(0, py2 - py1)
+                            ag = max(0, gx2 - gx1) * max(0, gy2 - gy1)
+                            pa[key].append(float(inter / (ap + ag - inter + 1e-6)))
+                        # Mask GT warp.
+                        pa["mask_gt_warp_dice_s"].append(_compute_dice_soft(
+                            gt_warp[b, t, k].unsqueeze(0), gt_mask_5d[b, t, k].unsqueeze(0)))
+                        pa["mask_gt_warp_dice_h"].append(_compute_dice_hard(
+                            gt_warp[b, t, k].unsqueeze(0), gt_mask_5d[b, t, k].unsqueeze(0)))
+                        # Pred warp.
+                        for suffix, mw in [("n", mask_warp_full), ("z", warp_mask_by_bbox(
+                                mask_t_flat, bbox_t_flat, ab["z"]["pred_struct"]["bbox"].reshape(B_T1, K, 4),
+                                out_size=H).reshape(B, T - 1, K, 1, H, W)),
+                                           ("s", warp_mask_by_bbox(
+                                mask_t_flat, bbox_t_flat, ab["s"]["pred_struct"]["bbox"].reshape(B_T1, K, 4),
+                                out_size=H).reshape(B, T - 1, K, 1, H, W))]:
+                            ms = mw[b, t, k].unsqueeze(0); gs = gt_mask_5d[b, t, k].unsqueeze(0)
+                            pa[f"mask_pred_{suffix}_dice_s"].append(_compute_dice_soft(ms, gs))
+                            pa[f"mask_pred_{suffix}_dice_h"].append(_compute_dice_hard(ms, gs))
+
+                        # Center-safe filters.
+                        is_cs = is_center_safe(bbox_t[b, t, k], act)
+                        is_ns = act != 0
+                        for filt, cond in [("all", True), ("cs", is_cs), ("ns", is_ns),
+                                           ("cs_ns", is_cs and is_ns)]:
+                            if not cond: continue
+                            of = oracle[filt]
+                            of["mask_gt_warp_dice_s"].append(_compute_dice_soft(
+                                gt_warp[b, t, k].unsqueeze(0), gt_mask_5d[b, t, k].unsqueeze(0)))
+                            of["mask_gt_warp_dice_h"].append(_compute_dice_hard(
+                                gt_warp[b, t, k].unsqueeze(0), gt_mask_5d[b, t, k].unsqueeze(0)))
+                            for suf, mw in [("n", mask_warp_full), ("z", warp_mask_by_bbox(
+                                    mask_t_flat, bbox_t_flat,
+                                    ab["z"]["pred_struct"]["bbox"].reshape(B_T1, K, 4),
+                                    out_size=H).reshape(B, T - 1, K, 1, H, W))]:
+                                ms = mw[b, t, k].unsqueeze(0)
+                                gs = gt_mask_5d[b, t, k].unsqueeze(0)
+                                of[f"mask_pred_{suf}_dice_s"].append(_compute_dice_soft(ms, gs))
+                                of[f"mask_pred_{suf}_dice_h"].append(_compute_dice_hard(ms, gs))
+                            of["bbox_n"].append(pa["bbox_n"][-1])
+                            of["bbox_z"].append(pa["bbox_z"][-1])
 
         # PSNR.
         if len(acc["n_psnr"]) < 50:
@@ -500,6 +830,7 @@ def main():
 
         if first_batch is None:
             first_batch = batch; first_n = ab["n"]["recon"]; first_z = ab["z"]["recon"]
+            first_ab = ab
 
         if bi % 5 == 0:
             ni = np.mean(acc["n_iou"][-100:]) if acc["n_iou"] else 0
@@ -564,8 +895,76 @@ def main():
             if v: res[f"swap_{k}"] = float(np.mean(v))
 
     # === GO ===
+    # --- Oracle results (V14.2) ---
+    if oracle is not None:
+        for key in ["identity_dice_s", "identity_dice_h", "identity_iou_h",
+                    "gt_warp_dice_s", "gt_warp_dice_h", "gt_warp_iou_h"]:
+            if oracle[key]:
+                res[f"oracle_{key}"] = float(np.mean(oracle[key]))
+        for mode in ["normal", "zero", "shuffle"]:
+            for t in ["dice_s", "dice_h"]:
+                k = f"pred_warp_{mode}_{t}"
+                if oracle.get(k):
+                    res[f"oracle_{k}"] = float(np.mean(oracle[k]))
+        res["oracle_pred_warp_gap_zero_dice_h"] = (
+            res.get("oracle_pred_warp_normal_dice_h", 0) -
+            res.get("oracle_pred_warp_zero_dice_h", 0))
+        # Per-action.
+        res["oracle_per_action"] = {}
+        for a in range(5):
+            pa = oracle["per_action"][a]
+            if pa["count"] == 0: continue
+            res["oracle_per_action"][str(a)] = {
+                "count": pa["count"],
+                "bbox_iou_n": float(np.mean(pa["bbox_n"])),
+                "bbox_iou_z": float(np.mean(pa["bbox_z"])),
+                "bbox_gap_zero": float(np.mean(pa["bbox_n"]) - np.mean(pa["bbox_z"])),
+                "mask_gt_warp_dice_s": float(np.mean(pa["mask_gt_warp_dice_s"])),
+                "mask_gt_warp_dice_h": float(np.mean(pa["mask_gt_warp_dice_h"])),
+                "mask_pred_n_dice_s": float(np.mean(pa["mask_pred_n_dice_s"])),
+                "mask_pred_z_dice_s": float(np.mean(pa["mask_pred_z_dice_s"])),
+                "mask_pred_n_dice_h": float(np.mean(pa["mask_pred_n_dice_h"])),
+                "mask_pred_z_dice_h": float(np.mean(pa["mask_pred_z_dice_h"])),
+                "mask_gap_pred_zero_h": float(np.mean(pa["mask_pred_n_dice_h"]) - np.mean(pa["mask_pred_z_dice_h"])),
+            }
+        # Center-safe.
+        for filt in ["all", "cs", "ns", "cs_ns"]:
+            of = oracle[filt]
+            if not of["bbox_n"]: continue
+            key = f"oracle_{filt}"
+            res[key] = {
+                "n": len(of["bbox_n"]),
+                "bbox_iou_n": float(np.mean(of["bbox_n"])),
+                "bbox_iou_z": float(np.mean(of["bbox_z"])),
+                "mask_gt_warp_dice_h": float(np.mean(of["mask_gt_warp_dice_h"])),
+                "mask_pred_n_dice_h": float(np.mean(of["mask_pred_n_dice_h"])),
+                "mask_pred_z_dice_h": float(np.mean(of["mask_pred_z_dice_h"])),
+                "mask_gap_pred_zero_h": float(np.mean(of["mask_pred_n_dice_h"]) - np.mean(of["mask_pred_z_dice_h"])),
+            }
+
+        # Diagnosis.
+        id_h = res.get("oracle_identity_dice_h", 0)
+        gt_h = res.get("oracle_gt_warp_dice_h", 0)
+        pred_n_h = res.get("oracle_pred_warp_normal_dice_h", 0)
+        gap_h = res.get("oracle_pred_warp_gap_zero_dice_h", 0)
+        if id_h < 0.95:
+            res["diagnosis_case"] = "warp_bug"
+        elif gt_h < 0.85:
+            res["diagnosis_case"] = "data_alignment_bug"
+        elif pred_n_h < 0.5 and gt_h > 0.85:
+            res["diagnosis_case"] = "model_bbox_error"
+        elif pred_n_h >= 0.5 and gap_h < 0.1:
+            res["diagnosis_case"] = "mask_not_z_sensitive"
+        else:
+            res["diagnosis_case"] = "pass"
+        res["go_mask_oracle"] = gt_h > 0.85
+        res["go_mask_pred"] = pred_n_h > res.get("oracle_pred_warp_zero_dice_h", 0)
+        res["bridge2_ready"] = id_h > 0.95 and gt_h > 0.85
+
     res["go_bbox_gap"] = res.get("bbox_gap_zero", 0) > 0.1
     res["go_mask_gap"] = res.get("mask_gap_warp", 0) > 0.1
+    if oracle is not None:
+        res["go_mask_pred_gap"] = res.get("oracle_pred_warp_gap_zero_dice_h", 0) > 0.1
     res["go_action_probe"] = res.get("action_probe_acc", 0) > 0.8
     best_swap = max(res.get("swap_acc_ns", 0), res.get("swap_acc_cs_ns", 0),
                     res.get("swap_eff_acc", 0))
@@ -579,6 +978,28 @@ def main():
         if isinstance(v, float): print(f"  {k}: {v:.4f}")
         elif isinstance(v, bool): print(f"  {k}: {'✓' if v else '✗'}")
         elif isinstance(v, list): print(f"  {k}: {[f'{x:.4f}' for x in v]}")
+    # Oracle summary.
+    if oracle is not None:
+        print(f"\n  ORACLE DIAGNOSTICS")
+        for k in ["oracle_identity_dice_h", "oracle_gt_warp_dice_h", "oracle_pred_warp_normal_dice_h",
+                  "oracle_pred_warp_zero_dice_h", "oracle_pred_warp_gap_zero_dice_h",
+                  "diagnosis_case", "bridge2_ready"]:
+            v = res.get(k, "N/A")
+            print(f"  {k}: {v}")
+        if "oracle_per_action" in res:
+            print(f"\n  PER-ACTION (bbox_iou_n / mask_gt_warp_dice_h / mask_pred_n_dice_h / gap):")
+            for an, ad in sorted(res["oracle_per_action"].items()):
+                print(f"    {ACTION_NAMES[int(an)]:6s}: count={ad['count']:5d}  "
+                      f"bbox_n={ad['bbox_iou_n']:.3f}  gt_warp_h={ad['mask_gt_warp_dice_h']:.3f}  "
+                      f"pred_n_h={ad['mask_pred_n_dice_h']:.3f}  gap_h={ad['mask_gap_pred_zero_h']:.3f}")
+        print(f"\n  CENTER-SAFE BREAKDOWN:")
+        for fk in ["oracle_all", "oracle_cs", "oracle_ns", "oracle_cs_ns"]:
+            if fk in res:
+                d = res[fk]
+                print(f"    {fk.replace('oracle_',''):8s}: n={d['n']:5d}  bbox_n={d['bbox_iou_n']:.3f}  "
+                      f"gt_warp_h={d['mask_gt_warp_dice_h']:.3f}  pred_n_h={d['mask_pred_n_dice_h']:.3f}  "
+                      f"gap_h={d['mask_gap_pred_zero_h']:.3f}")
+
     print(f"\n  GO: {res['go_count']}/5")
     for t, k in [("bbox gap > 0.1", "go_bbox_gap"), ("mask gap > 0.1", "go_mask_gap"),
                  ("action probe > 0.8", "go_action_probe"), ("swap > 0.7", "go_swap"),
@@ -595,6 +1016,19 @@ def main():
         _save_mask_warp_panel(model, device, first_batch,
                               os.path.join(out_dir, "mask_warp_panel.png"))
         print("  reconstruction_panel.png, mask_warp_panel.png")
+
+    # Oracle visualizations.
+    if oracle is not None and first_batch is not None:
+        try:
+            _save_mask_oracle_panel(first_batch, first_ab, device, model,
+                                    os.path.join(out_dir, "mask_oracle_panel.png"))
+            print("  mask_oracle_panel.png")
+            _save_per_action_mask_dice(res, os.path.join(out_dir, "per_action_mask_dice.png"))
+            print("  per_action_mask_dice.png")
+            _save_mask_gap_breakdown(res, os.path.join(out_dir, "mask_gap_breakdown.png"))
+            print("  mask_gap_breakdown.png")
+        except Exception as e:
+            print(f"  Warning: oracle viz failed: {e}")
 
     if len(all_z) >= 10:
         z_arr = np.asarray(all_z)
