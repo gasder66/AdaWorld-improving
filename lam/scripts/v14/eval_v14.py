@@ -517,13 +517,15 @@ def main():
                         help="Override max_batches (alias)")
     parser.add_argument("--out_dir", default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--val_dir", default=None,
+                        help="Override validation data directory (default: data/bridgebench/bridge1/val)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
     ROOT = os.path.join(os.path.dirname(__file__), "../../..")
-    val_dir = os.path.join(ROOT, "data", "bridgebench", "bridge1", "val")
+    val_dir = args.val_dir or os.path.join(ROOT, "data", "bridgebench", "bridge1", "val")
     # Output dir: --output_dir > --out_dir > default, with oracle suffix if applicable.
     out_dir = (args.output_dir or args.out_dir or
                os.path.join(ROOT, "result", "v14", "bridge1",
@@ -856,6 +858,8 @@ def main():
     res["bbox_gap_shuffle"] = res.get("normal_iou", 0) - res.get("z_shuffle_iou", 0)
     res["mask_gap_head"] = res.get("normal_dice_head", 0) - res.get("z_zero_dice_head", 0)
     res["mask_gap_warp"] = res.get("normal_dice_warp", 0) - res.get("z_zero_dice_warp", 0)
+    res["z_shuffle_order_ok"] = (res.get("normal_iou", 0) > res.get("z_zero_iou", 0) >
+                                 res.get("z_shuffle_iou", 0))
 
     # Clustering.
     if len(all_z) >= 10 and len(np.unique(all_action)) >= 2:
@@ -972,6 +976,16 @@ def main():
     res["go_obj_psnr"] = res.get("normal_obj_psnr", 0) > res.get("z_zero_obj_psnr", 0)
     res["go_count"] = sum([res["go_bbox_gap"], res["go_mask_gap"], res["go_action_probe"],
                            res["go_swap"], res["go_obj_psnr"]])
+    # Curriculum GO (V14.4).
+    res["go_curriculum_bbox"] = res.get("bbox_gap_zero", 0) > 0.1
+    res["go_curriculum_action"] = res.get("action_probe_acc", 0) > 0.8
+    res["go_curriculum_swap"] = (res.get("swap_acc_ns", 0) > 0.7 or res.get("swap_acc_cs_ns", 0) > 0.7)
+    res["go_curriculum_shuffle"] = res.get("z_shuffle_order_ok", False)
+    res["go_curriculum_oracle"] = (res.get("oracle_identity_dice_h", 0) > 0.95 and
+                                    res.get("oracle_gt_warp_dice_h", 0) > 0.90)
+    res["go_curriculum_count"] = sum([res["go_curriculum_bbox"], res["go_curriculum_action"],
+                                       res["go_curriculum_swap"], res["go_curriculum_shuffle"],
+                                       res["go_curriculum_oracle"]])
 
     print(f"\n{'='*60}\n  RESULTS  ({res['go_count']}/5 GO)\n{'='*60}")
     for k, v in res.items():
@@ -1000,11 +1014,17 @@ def main():
                       f"gt_warp_h={d['mask_gt_warp_dice_h']:.3f}  pred_n_h={d['mask_pred_n_dice_h']:.3f}  "
                       f"gap_h={d['mask_gap_pred_zero_h']:.3f}")
 
-    print(f"\n  GO: {res['go_count']}/5")
+    print(f"\n  GO: {res['go_count']}/5  |  Curriculum: {res['go_curriculum_count']}/5")
     for t, k in [("bbox gap > 0.1", "go_bbox_gap"), ("mask gap > 0.1", "go_mask_gap"),
                  ("action probe > 0.8", "go_action_probe"), ("swap > 0.7", "go_swap"),
                  ("obj psnr normal > zero", "go_obj_psnr")]:
         print(f"    {'✓' if res[k] else '✗'} {t}")
+    print(f"  Curriculum GO:", end="")
+    for t, k in [("bbox>0.1", "go_curriculum_bbox"), ("action>0.8", "go_curriculum_action"),
+                 ("swap>0.7", "go_curriculum_swap"), ("shuffle_ok", "go_curriculum_shuffle"),
+                 ("oracle_ok", "go_curriculum_oracle")]:
+        print(f" {'✓' if res[k] else '✗'}{t}", end="")
+    print()
 
     # === Visualizations ===
     _save_ablation_bar(res, os.path.join(out_dir, "z_ablation.png"))

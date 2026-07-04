@@ -147,6 +147,29 @@ def _generate_sample(bank_objects, rng, image_size, num_objects, T, step_size):
     return sample
 
 
+def _pad_to_max_slots(sample: dict, K: int, K_max: int) -> dict:
+    """Pad sample from K objects to K_max slots. Extra slots get valid=False."""
+    if K >= K_max:
+        return sample
+    T = sample["video"].shape[0]
+    H, W = sample["masks"].shape[-2:]
+
+    for key in ["masks", "visible_masks", "full_masks"]:
+        pad = torch.zeros(T, K_max - K, H, W, dtype=sample[key].dtype)
+        sample[key] = torch.cat([sample[key], pad], dim=1)
+    sample["boxes"] = torch.cat([sample["boxes"], torch.zeros(T, K_max - K, 4)], dim=1)
+    sample["valid"] = torch.cat([sample["valid"], torch.zeros(T, K_max - K, dtype=torch.bool)], dim=1)
+    sample["actions"] = torch.cat([sample["actions"],
+                                   torch.full((T - 1, K_max - K), -1, dtype=torch.long)], dim=1)
+    sample["actor_id"] = torch.cat([sample["actor_id"],
+                                    torch.full((K_max - K,), -1, dtype=torch.long)])
+    sample["category"] = torch.cat([sample["category"],
+                                    torch.full((K_max - K,), -1, dtype=torch.long)])
+    sample["depth_order"] = torch.cat([sample["depth_order"],
+                                       torch.full((T, K_max - K), -1, dtype=torch.long)], dim=1)
+    return sample
+
+
 def _validate_sample(sample, num_objects, T):
     """Check for empty masks on valid objects."""
     masks = sample["masks"]
@@ -197,6 +220,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_stats", action="store_true")
     parser.add_argument("--no_occlusion", action="store_true")
+    parser.add_argument("--max_slots", type=int, default=None,
+                        help="Pad to K_max slots with valid=False (default: same as num_objects)")
     args = parser.parse_args()
 
     if not os.path.exists(args.object_bank):
@@ -214,6 +239,7 @@ def main():
     rng = np.random.RandomState(args.seed)
     stats = {"empty_mask_count": 0, "gt_warp_dice_samples": [],
              "action_dist": {a: 0 for a in range(5)}}
+    K_max = args.max_slots if args.max_slots is not None else args.num_objects
 
     for split, n in [("train", args.n_train), ("val", args.n_val)]:
         out_dir = os.path.join(args.out, split)
@@ -237,6 +263,9 @@ def main():
             for t in range(args.T - 1):
                 for k in range(args.num_objects):
                     stats["action_dist"][int(actions[t, k])] += 1
+            # Pad to K_max if needed.
+            if K_max > args.num_objects:
+                sample = _pad_to_max_slots(sample, args.num_objects, K_max)
             torch.save(sample, os.path.join(out_dir, f"sample_{i:06d}.pt"))
         print(f"  Saved {n} samples to {out_dir}")
 

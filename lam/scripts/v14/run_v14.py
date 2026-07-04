@@ -19,6 +19,8 @@ VERSION = "v14"
 BRIDGE_DEFAULTS = {
     "bridge1": {"image_size": 128, "max_actors": 4},
     "bridge1_clean": {"image_size": 128, "max_actors": 4},
+    "bridge1_clean_k1": {"image_size": 128, "max_actors": 4},
+    "bridge1_clean_k2": {"image_size": 128, "max_actors": 4},
     "bridge1_clean_sharded": {"image_size": 128, "max_actors": 4},
 }
 
