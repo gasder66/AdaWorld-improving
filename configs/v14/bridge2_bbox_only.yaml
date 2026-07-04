@@ -1,0 +1,46 @@
+# Bridge-2 bbox-only baseline config.
+image_size: 128
+sequence_length: 5
+num_objects: 4
+
+structure:
+  dim: 128
+  temporal_layers: 2
+  slot_layers: 1
+  heads: 4
+  use_mask_structure: false   # bbox only
+  mask_grid: 16
+  mask_feat_dim: 32
+
+latent:
+  dim: 16
+  free_bits: 0.05
+  beta_kl: 0.01
+
+idm:
+  layers: 2
+  heads: 4
+
+fdm:
+  layers: 2
+  heads: 4
+
+renderer:
+  base_dim: 32
+
+loss:
+  lambda_box: 10.0
+  lambda_mask: 0.0        # no mask loss
+  lambda_iou: 1.0
+  lambda_exist: 1.0
+  lambda_vis: 0.0
+  lambda_recon: 0.05
+  lambda_kl: 0.01
+
+train:
+  batch_size: 8
+  lr: 2.5e-4
+  steps_phase_b: 5000
+  steps_phase_c: 5000
+  grad_clip: 0.3
+  checkpoint_every: 500

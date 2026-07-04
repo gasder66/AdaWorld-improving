@@ -18,6 +18,8 @@ VERSION = "v14"
 
 BRIDGE_DEFAULTS = {
     "bridge1": {"image_size": 128, "max_actors": 4},
+    "bridge1_clean": {"image_size": 128, "max_actors": 4},
+    "bridge1_clean_sharded": {"image_size": 128, "max_actors": 4},
 }
 
 
@@ -52,6 +54,9 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--checkpoint_every", type=int, default=500)
     parser.add_argument("--grad_clip", type=float, default=0.3)
+    parser.add_argument("--use_shards", action="store_true",
+                        help="Use shard dataset instead of per-file loading")
+    parser.add_argument("--output", default=None, help="Override output directory")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -60,16 +65,23 @@ def main():
     cfg = BRIDGE_DEFAULTS[args.dataset]
     ROOT = os.path.join(os.path.dirname(__file__), "../../..")
     data_dir = args.data_root or os.path.join(ROOT, "data", "bridgebench", args.dataset)
-    out_dir = os.path.join(ROOT, "result", VERSION, args.dataset, f"phase{args.phase}")
+    out_dir = args.output or os.path.join(ROOT, "result", VERSION, args.dataset, f"phase{args.phase}")
     os.makedirs(os.path.join(out_dir, "ckpts"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "losses"), exist_ok=True)
 
-    print(f"\n{'='*60}\nV14 BridgeBench\n  dataset={args.dataset}, phase={args.phase}\n  out={out_dir}\n{'='*60}")
+    print(f"\n{'='*60}\nV14 BridgeBench\n  dataset={data_dir}, phase={args.phase}\n  out={out_dir}\n{'='*60}")
 
     # Load data.
-    train_dir = os.path.join(data_dir, "train")
-    train_files = sorted([os.path.join(train_dir, f) for f in os.listdir(train_dir) if f.endswith(".pt")])
-    print(f"  Train: {len(train_files)} samples")
+    if args.use_shards:
+        from lam.datasets.bridgebench_shard_dataset import BridgeBenchShardDataset
+        train_dataset = BridgeBenchShardDataset(data_dir, "train")
+        shard_mode = True
+    else:
+        train_dir = os.path.join(data_dir, "train")
+        train_files = sorted([os.path.join(train_dir, f) for f in os.listdir(train_dir) if f.endswith(".pt")])
+        train_dataset = train_files
+        shard_mode = False
+    print(f"  Train: {len(train_dataset)} samples" + (" (shard)" if shard_mode else ""))
 
     model = V14Model(image_size=cfg["image_size"], max_actors=cfg["max_actors"]).to(device)
     if args.checkpoint:
@@ -88,8 +100,12 @@ def main():
     torch.cuda.reset_peak_memory_stats(device)
 
     while step < args.steps:
-        indices = torch.randperm(len(train_files))[:args.batch_size]
-        batch_list = [torch.load(train_files[i], map_location="cpu", weights_only=False) for i in indices]
+        if shard_mode:
+            indices = torch.randperm(len(train_dataset))[:args.batch_size]
+            batch_list = [train_dataset[int(i)] for i in indices]
+        else:
+            indices = torch.randperm(len(train_files))[:args.batch_size]
+            batch_list = [torch.load(train_files[i], map_location="cpu", weights_only=False) for i in indices]
         batch = collate(batch_list)
         for k in list(batch.keys()):
             if isinstance(batch[k], torch.Tensor):

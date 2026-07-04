@@ -8,7 +8,7 @@ Usage:
       --n_train 5000 --n_val 500 \
       --image_size 128 --num_objects 4 --step_size 8
 """
-import argparse, os, sys
+import argparse, os, sys, json
 
 import numpy as np
 import torch
@@ -147,6 +147,43 @@ def _generate_sample(bank_objects, rng, image_size, num_objects, T, step_size):
     return sample
 
 
+def _validate_sample(sample, num_objects, T):
+    """Check for empty masks on valid objects."""
+    masks = sample["masks"]
+    valid = sample["valid"]
+    for t in range(T):
+        for k in range(num_objects):
+            if valid[t, k] and masks[t, k].sum() < 1:
+                return False, f"empty mask t={t} k={k}"
+    return True, ""
+
+
+def _spot_check_gt_warp(sample, num_objects, T):
+    """GT warp oracle spot-check on a single sample."""
+    from lam.modules.v14_mask_warp import warp_mask_by_bbox
+    mask_t = sample["masks"][:-1].unsqueeze(0)   # (1, T-1, K, H, W)
+    bbox_t = sample["boxes"][:-1].unsqueeze(0)    # (1, T-1, K, 4)
+    gt_bbox_tp1 = sample["boxes"][1:].unsqueeze(0)  # (1, T-1, K, 4)
+    gt_mask_tp1 = sample["masks"][1:].unsqueeze(0)
+
+    B, T1, K, H, W = 1, T - 1, num_objects, mask_t.shape[-2], mask_t.shape[-1]
+    gt_warp = warp_mask_by_bbox(
+        mask_t.reshape(B * T1, K, 1, H, W),
+        bbox_t.reshape(B * T1, K, 4),
+        gt_bbox_tp1.reshape(B * T1, K, 4),
+        out_size=H,
+    ).reshape(B, T1, K, 1, H, W)
+
+    dices = []
+    for t in range(T1):
+        for k in range(K):
+            if sample["valid"][t, k] and gt_mask_tp1[0, t, k].sum() > 0:
+                inter = (gt_warp[0, t, k, 0].clamp(0, 1) * gt_mask_tp1[0, t, k]).sum()
+                denom = gt_warp[0, t, k, 0].sum() + gt_mask_tp1[0, t, k].sum() + 1e-6
+                dices.append(float(2 * inter / denom))
+    return float(np.mean(dices)) if dices else 1.0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--object_bank", default="data/bridgebench/object_bank.pt")
@@ -158,6 +195,8 @@ def main():
     parser.add_argument("--step_size", type=int, default=8)
     parser.add_argument("--T", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save_stats", action="store_true")
+    parser.add_argument("--no_occlusion", action="store_true")
     args = parser.parse_args()
 
     if not os.path.exists(args.object_bank):
@@ -173,6 +212,8 @@ def main():
     print(f"Loaded {len(bank)} objects, {len(cat_set)} categories: {cat_set}")
 
     rng = np.random.RandomState(args.seed)
+    stats = {"empty_mask_count": 0, "gt_warp_dice_samples": [],
+             "action_dist": {a: 0 for a in range(5)}}
 
     for split, n in [("train", args.n_train), ("val", args.n_val)]:
         out_dir = os.path.join(args.out, split)
@@ -180,10 +221,35 @@ def main():
         for i in range(n):
             sample = _generate_sample(bank, rng, args.image_size, args.num_objects,
                                       args.T, args.step_size)
+            # Quality check.
+            ok, err = _validate_sample(sample, args.num_objects, args.T)
+            if not ok:
+                stats["empty_mask_count"] += 1
+                if stats["empty_mask_count"] <= 5:
+                    print(f"  WARNING: {err}")
+                continue  # retry?
+            # Spot-check GT warp.
+            if args.save_stats and i % 100 == 0 and i == 0:
+                dice = _spot_check_gt_warp(sample, args.num_objects, args.T)
+                stats["gt_warp_dice_samples"].append(dice)
+            # Action distribution.
+            actions = sample["actions"]
+            for t in range(args.T - 1):
+                for k in range(args.num_objects):
+                    stats["action_dist"][int(actions[t, k])] += 1
             torch.save(sample, os.path.join(out_dir, f"sample_{i:06d}.pt"))
         print(f"  Saved {n} samples to {out_dir}")
 
     print(f"Bridge-1 dataset ready: {args.out}")
+    if args.save_stats:
+        stats["num_train"] = args.n_train
+        stats["num_val"] = args.n_val
+        stats["gt_warp_dice_mean"] = float(np.mean(stats["gt_warp_dice_samples"])) if stats["gt_warp_dice_samples"] else 0
+        stats_path = os.path.join(args.out, "stats.json")
+        with open(stats_path, "w") as f:
+            json.dump(stats, f, indent=2, default=str)
+        print(f"  Stats → {stats_path}")
+        print(f"  Empty masks: {stats['empty_mask_count']}, GT warp dice: {stats['gt_warp_dice_mean']:.4f}")
 
 
 if __name__ == "__main__":
