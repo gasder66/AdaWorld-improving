@@ -29,22 +29,18 @@ class MaskStructureExtractor(nn.Module):
         self.mask_feat_dim = mask_feat_dim
         self.use_moments = use_moments
         self.use_mask_structure = use_mask_structure
+        # Always create mask CNN for checkpoint compatibility.
+        self.mask_compress = nn.Sequential(
+            nn.Conv2d(1, 16, 3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(16, mask_feat_dim, 3, stride=2, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((2, 2)),
+        )
+        self.mask_proj = nn.Linear(mask_feat_dim * 4, mask_feat_dim)
 
-        if use_mask_structure:
-            self.mask_compress = nn.Sequential(
-                nn.Conv2d(1, 16, 3, stride=2, padding=1),
-                nn.GELU(),
-                nn.Conv2d(16, mask_feat_dim, 3, stride=2, padding=1),
-                nn.GELU(),
-                nn.AdaptiveAvgPool2d((2, 2)),
-            )
-            self.mask_proj = nn.Linear(mask_feat_dim * 4, mask_feat_dim)
-        else:
-            self.mask_compress = None
-            self.mask_proj = None
-
-        # raw_dim = bbox(4) + geometry(2) + moments(6 if use_moments else 0) + visible(2) + mask_feat(32 if mask else 0)
-        self.raw_dim = 4 + 2 + (6 if use_moments else 0) + 2 + (mask_feat_dim if use_mask_structure else 0)
+        # raw_dim always includes mask_feat for checkpoint compatibility; bbox-only zeros them.
+        self.raw_dim = 4 + 2 + (6 if use_moments else 0) + 2 + mask_feat_dim
 
     def _mask_moments(self, masks: Tensor) -> Tensor:
         """6 moments per mask: area, mean_xy, var_xy, cov_xy."""
@@ -92,22 +88,18 @@ class MaskStructureExtractor(nn.Module):
         occ_flag = (vis_ratio < 0.95).float()
         visible = torch.cat([vis_ratio, occ_flag], dim=-1)
 
-        # Low-res mask CNN.
-        if self.use_mask_structure:
-            masks_flat = masks.reshape(B * T * K, 1, H, W)
-            mask_low = F.adaptive_avg_pool2d(masks_flat, (self.mask_grid, self.mask_grid))
-            mask_feat = self.mask_compress(mask_low).flatten(1)
-            mask_feat = self.mask_proj(mask_feat).reshape(B, T, K, self.mask_feat_dim)
-        else:
-            mask_feat = torch.zeros(B, T, K, 0, device=boxes.device)
+        # Low-res mask CNN (always compute for checkpoint compat; bbox-only zeros after).
+        masks_flat = masks.reshape(B * T * K, 1, H, W)
+        mask_low = F.adaptive_avg_pool2d(masks_flat, (self.mask_grid, self.mask_grid))
+        mask_feat = self.mask_compress(mask_low).flatten(1)
+        mask_feat = self.mask_proj(mask_feat).reshape(B, T, K, self.mask_feat_dim)
+        if not self.use_mask_structure:
+            mask_feat = mask_feat * 0  # zero out mask features for bbox-only
 
         raw_struct = torch.cat([bbox, geo, moments, visible, mask_feat], dim=-1)
 
         # Targets for GT mask at grid resolution.
-        if self.use_mask_structure:
-            mask_low_gt = mask_low.reshape(B, T, K, 1, self.mask_grid, self.mask_grid)
-        else:
-            mask_low_gt = torch.zeros(B, T, K, 1, self.mask_grid, self.mask_grid, device=boxes.device)
+        mask_low_gt = mask_low.reshape(B, T, K, 1, self.mask_grid, self.mask_grid)
 
         targets = {
             "bbox": bbox,

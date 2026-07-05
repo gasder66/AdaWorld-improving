@@ -24,6 +24,7 @@ BRIDGE_DEFAULTS = {
     "bridge1_clean_k2": {"image_size": 128, "max_actors": 4},
     "bridge1_clean_k2_sharded": {"image_size": 128, "max_actors": 4},
     "bridge1_clean_sharded": {"image_size": 128, "max_actors": 4},
+    "bridge2_occlusion_clean_sharded": {"image_size": 128, "max_actors": 4},
 }
 
 
