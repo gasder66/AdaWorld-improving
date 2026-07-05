@@ -20,7 +20,9 @@ BRIDGE_DEFAULTS = {
     "bridge1": {"image_size": 128, "max_actors": 4},
     "bridge1_clean": {"image_size": 128, "max_actors": 4},
     "bridge1_clean_k1": {"image_size": 128, "max_actors": 4},
+    "bridge1_clean_k1_sharded": {"image_size": 128, "max_actors": 4},
     "bridge1_clean_k2": {"image_size": 128, "max_actors": 4},
+    "bridge1_clean_k2_sharded": {"image_size": 128, "max_actors": 4},
     "bridge1_clean_sharded": {"image_size": 128, "max_actors": 4},
 }
 
@@ -85,6 +87,14 @@ def main():
         shard_mode = False
     print(f"  Train: {len(train_dataset)} samples" + (" (shard)" if shard_mode else ""))
 
+    # Pre-load all data into memory for fast training.
+    if not shard_mode:
+        print(f"  Pre-loading {len(train_files)} files into memory...")
+        cache = [torch.load(f, map_location="cpu", weights_only=False) for f in train_files]
+        print(f"  Memory cache ready ({len(cache)} samples)")
+    else:
+        cache = None
+
     model = V14Model(image_size=cfg["image_size"], max_actors=cfg["max_actors"]).to(device)
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
@@ -105,6 +115,9 @@ def main():
         if shard_mode:
             indices = torch.randperm(len(train_dataset))[:args.batch_size]
             batch_list = [train_dataset[int(i)] for i in indices]
+        elif cache is not None:
+            indices = torch.randperm(len(cache))[:args.batch_size]
+            batch_list = [cache[int(i)] for i in indices]
         else:
             indices = torch.randperm(len(train_files))[:args.batch_size]
             batch_list = [torch.load(train_files[i], map_location="cpu", weights_only=False) for i in indices]
