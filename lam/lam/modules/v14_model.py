@@ -45,17 +45,21 @@ class V14Model(nn.Module):
         dyn_heads: int = 4,
         free_bits: float = 0.05,
         dropout: float = 0.0,
+        # Bbox-only mode (V14.5 Bridge-2 baseline)
+        use_mask_structure: bool = True,
     ):
         super().__init__()
         self.image_size = image_size
         self.latent_dim = latent_dim
         self.free_bits = free_bits
+        self.use_mask_structure = use_mask_structure
 
         self.content_encoder = ObjectContentEncoder(
             crop_size=crop_size, content_dim=content_dim,
         )
         self.structure_extractor = MaskStructureExtractor(
             mask_grid=mask_grid, mask_feat_dim=mask_feat_dim,
+            use_mask_structure=use_mask_structure,
         )
         raw_dim = self.structure_extractor.raw_dim
         self.structure_encoder = CausalMaskStructureEncoder(

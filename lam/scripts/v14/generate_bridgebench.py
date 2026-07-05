@@ -147,6 +147,137 @@ def _generate_sample(bank_objects, rng, image_size, num_objects, T, step_size):
     return sample
 
 
+def _generate_sample_occlusion(bank_objects, rng, image_size, num_objects, T, step_size):
+    """Bridge-2: real objects with occlusion via depth-order layering."""
+    H = W = image_size
+    cs = bank_objects[0]["image_crop"].shape[1]
+
+    # Pick K random objects.
+    cats = list(set(o["category"] for o in bank_objects))
+    picked_cats = rng.choice(cats, size=min(num_objects, len(cats)), replace=False)
+    picked = []
+    for cat in picked_cats:
+        cat_objs = [o for o in bank_objects if o["category"] == cat]
+        picked.append(cat_objs[rng.randint(len(cat_objs))])
+    while len(picked) < num_objects:
+        picked.append(bank_objects[rng.randint(len(bank_objects))])
+    rng.shuffle(picked)
+
+    # Assign positions — clustered for occlusion.
+    positions = np.zeros((T, num_objects, 2), dtype=np.float32)
+    base_cx, base_cy = W * 0.45, H * 0.45
+    offsets = [(0, 0), (W * 0.15, 0), (0, H * 0.15), (W * 0.12, H * 0.12)]
+    for k in range(min(num_objects, 4)):
+        positions[0, k] = [base_cx + offsets[k][0], base_cy + offsets[k][1]]
+
+    obj_sizes = np.zeros((num_objects, 2), dtype=np.float32)
+    for k, obj in enumerate(picked):
+        w_h = obj["bbox"][2:4].numpy()
+        obj_sizes[k] = w_h * image_size
+
+    actions = np.zeros((T - 1, num_objects), dtype=np.int64)
+    for k in range(num_objects):
+        px, py = positions[0, k]
+        for t in range(1, T):
+            act = rng.randint(0, 5)
+            actions[t - 1, k] = act
+            step = 12  # larger step for bridge2 occlusion
+            dx, dy = ACTION_DELTA[act]
+            px += dx * step; py += dy * step
+            px = max(0, min(W - 1, px)); py = max(0, min(H - 1, py))
+            positions[t, k] = [px, py]
+
+    videos = np.zeros((T, 3, H, W), dtype=np.uint8)
+    full_masks = np.zeros((T, num_objects, H, W), dtype=np.uint8)
+    visible_masks = np.zeros((T, num_objects, H, W), dtype=np.uint8)
+    full_boxes = np.zeros((T, num_objects, 4), dtype=np.float32)
+    visible_boxes = np.zeros((T, num_objects, 4), dtype=np.float32)
+    valid = np.ones((T, num_objects), dtype=bool)
+    visible_valid = np.zeros((T, num_objects), dtype=bool)
+    depth_order = np.zeros((T, num_objects), dtype=np.int64)
+    occlusion_ratio = np.zeros((T, num_objects), dtype=np.float32)
+    bg_color = rng.randint(60, 200, (3,)).astype(np.uint8)
+
+    for t in range(T):
+        # Random depth order per frame.
+        order = rng.permutation(num_objects)
+        depth_order[t] = order
+
+        # Step 1: compute full_masks for each object.
+        obj_masks_pix = []
+        for k in range(num_objects):
+            px, py = positions[t, k]; ow, oh = obj_sizes[k]
+            x1 = int(px - ow / 2); y1 = int(py - oh / 2)
+            x2 = int(px + ow / 2); y2 = int(py + oh / 2)
+            x1, x2 = max(0, x1), min(W, x2)
+            y1, y2 = max(0, y1), min(H, y2)
+            if x2 > x1 and y2 > y1:
+                m = F.interpolate(picked[k]["mask_crop"].unsqueeze(0),
+                                  size=(y2 - y1, x2 - x1),
+                                  mode="bilinear", align_corners=False).squeeze(0)
+                full_mask_k = np.zeros((H, W), dtype=np.float32)
+                full_mask_k[y1:y2, x1:x2] = m[0].clamp(0, 1).numpy()
+            else:
+                full_mask_k = np.zeros((H, W), dtype=np.float32)
+            obj_masks_pix.append(full_mask_k)
+            full_masks[t, k] = (full_mask_k * 255).astype(np.uint8)
+            full_boxes[t, k] = [px / W, py / H, ow / W, oh / H]
+
+        # Step 2: compute visible masks via depth layering.
+        accumulated = np.zeros((H, W), dtype=np.float32)
+        for oi in reversed(range(num_objects)):
+            k = order[oi]  # bottom object first (oi = K-1)
+            full_k = obj_masks_pix[k]
+            vis_k = full_k * (1 - accumulated).clip(0, 1)
+            visible_masks[t, k] = (vis_k * 255).astype(np.uint8)
+            accumulated = (accumulated + full_k).clip(0, 1)
+
+            full_area = full_k.sum()
+            vis_area = vis_k.sum()
+            if full_area > 1:
+                occlusion_ratio[t, k] = 1 - vis_area / full_area
+            if vis_area > 4:
+                visible_valid[t, k] = True
+                # Compute visible_bbox from vis_k.
+                yy, xx = np.where(vis_k > 0.1)
+                if len(yy) > 0:
+                    vx1, vx2 = xx.min(), xx.max() + 1
+                    vy1, vy2 = yy.min(), yy.max() + 1
+                    visible_boxes[t, k] = [(vx1 + vx2) / 2 / W, (vy1 + vy2) / 2 / H,
+                                           (vx2 - vx1) / W, (vy2 - vy1) / H]
+
+        # Step 3: composite RGB by depth order (top to bottom = reversed order).
+        canvas = np.full((H, W, 3), bg_color, dtype=np.uint8)
+        for oi in range(num_objects):
+            k = order[oi]
+            px, py = positions[t, k]; ow, oh = obj_sizes[k]
+            canvas = _paste_crop(canvas, picked[k]["image_crop"], picked[k]["mask_crop"],
+                                 px, py, ow, oh, H, W)
+        videos[t] = torch.from_numpy(canvas).permute(2, 0, 1).numpy()
+
+    actor_ids = np.arange(num_objects, dtype=np.int64)
+    categories = np.array([picked[k].get("category_id", k) for k in range(num_objects)], dtype=np.int64)
+
+    sample = {
+        "video": torch.from_numpy(videos).float() / 255.0,
+        "masks": torch.from_numpy(full_masks.astype(np.float32)) / 255.0,
+        "visible_masks": torch.from_numpy(visible_masks.astype(np.float32)) / 255.0,
+        "full_masks": torch.from_numpy(full_masks.astype(np.float32)) / 255.0,
+        "boxes": torch.from_numpy(full_boxes),
+        "visible_boxes": torch.from_numpy(visible_boxes),
+        "valid": torch.from_numpy(valid),
+        "visible_valid": torch.from_numpy(visible_valid),
+        "actions": torch.from_numpy(actions),
+        "actor_id": torch.from_numpy(actor_ids),
+        "category": torch.from_numpy(categories),
+        "depth_order": torch.from_numpy(depth_order.astype(np.int64)),
+        "occlusion_ratio": torch.from_numpy(occlusion_ratio),
+        "is_occluded": torch.from_numpy(occlusion_ratio > 0.05),
+        "is_heavy_occluded": torch.from_numpy(occlusion_ratio > 0.4),
+    }
+    return sample
+
+
 def _pad_to_max_slots(sample: dict, K: int, K_max: int) -> dict:
     """Pad sample from K objects to K_max slots. Extra slots get valid=False."""
     if K >= K_max:
@@ -220,6 +351,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_stats", action="store_true")
     parser.add_argument("--no_occlusion", action="store_true")
+    parser.add_argument("--bridge", default="bridge1", choices=["bridge1", "bridge2_occlusion"],
+                        help="Bridge variant: bridge1 (no occlusion) or bridge2_occlusion")
     parser.add_argument("--max_slots", type=int, default=None,
                         help="Pad to K_max slots with valid=False (default: same as num_objects)")
     args = parser.parse_args()
@@ -245,15 +378,30 @@ def main():
         out_dir = os.path.join(args.out, split)
         os.makedirs(out_dir, exist_ok=True)
         for i in range(n):
-            sample = _generate_sample(bank, rng, args.image_size, args.num_objects,
-                                      args.T, args.step_size)
+            if args.bridge == "bridge2_occlusion":
+                sample = _generate_sample_occlusion(bank, rng, args.image_size, args.num_objects,
+                                                    args.T, args.step_size)
+            else:
+                sample = _generate_sample(bank, rng, args.image_size, args.num_objects,
+                                          args.T, args.step_size)
             # Quality check.
             ok, err = _validate_sample(sample, args.num_objects, args.T)
             if not ok:
                 stats["empty_mask_count"] += 1
                 if stats["empty_mask_count"] <= 5:
                     print(f"  WARNING: {err}")
-                continue  # retry?
+                continue
+            # Bridge-2 stats.
+            if args.bridge == "bridge2_occlusion" and args.save_stats:
+                occ = sample["occlusion_ratio"]
+                for t in range(args.T):
+                    for k in range(args.num_objects):
+                        if sample["valid"][t, k]:
+                            r = float(occ[t, k])
+                            stats.setdefault("occlusion_ratios", []).append(r)
+                            stats.setdefault("visible_valid_count", 0)
+                            if sample["visible_valid"][t, k]:
+                                stats["visible_valid_count"] += 1
             # Spot-check GT warp.
             if args.save_stats and i % 100 == 0 and i == 0:
                 dice = _spot_check_gt_warp(sample, args.num_objects, args.T)
@@ -269,16 +417,27 @@ def main():
             torch.save(sample, os.path.join(out_dir, f"sample_{i:06d}.pt"))
         print(f"  Saved {n} samples to {out_dir}")
 
-    print(f"Bridge-1 dataset ready: {args.out}")
+    print(f"Bridge-{args.bridge} dataset ready: {args.out}")
     if args.save_stats:
         stats["num_train"] = args.n_train
         stats["num_val"] = args.n_val
         stats["gt_warp_dice_mean"] = float(np.mean(stats["gt_warp_dice_samples"])) if stats["gt_warp_dice_samples"] else 0
+        if args.bridge == "bridge2_occlusion":
+            occs = stats.get("occlusion_ratios", [])
+            if occs:
+                stats["mean_occlusion_ratio"] = float(np.mean(occs))
+                stats["percent_occluded"] = 100 * sum(1 for r in occs if r > 0.05) / len(occs)
+                stats["percent_heavy_occluded"] = 100 * sum(1 for r in occs if r > 0.4) / len(occs)
+                stats["visible_valid_ratio"] = stats.get("visible_valid_count", 0) / max(len(occs), 1)
         stats_path = os.path.join(args.out, "stats.json")
         with open(stats_path, "w") as f:
             json.dump(stats, f, indent=2, default=str)
         print(f"  Stats → {stats_path}")
         print(f"  Empty masks: {stats['empty_mask_count']}, GT warp dice: {stats['gt_warp_dice_mean']:.4f}")
+        if args.bridge == "bridge2_occlusion":
+            print(f"  Occlusion: mean={stats.get('mean_occlusion_ratio',0):.3f} "
+                  f"occ%={stats.get('percent_occluded',0):.1f} "
+                  f"heavy%={stats.get('percent_heavy_occluded',0):.1f}")
 
 
 if __name__ == "__main__":

@@ -61,6 +61,8 @@ def main():
     parser.add_argument("--use_shards", action="store_true",
                         help="Use shard dataset instead of per-file loading")
     parser.add_argument("--output", default=None, help="Override output directory")
+    parser.add_argument("--use_mask_structure", type=lambda x: x.lower() != "false", default=True,
+                        help="Enable mask structure features (set false for bbox-only baseline)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -101,7 +103,8 @@ def main():
     else:
         cache = None
 
-    model = V14Model(image_size=cfg["image_size"], max_actors=cfg["max_actors"]).to(device)
+    model = V14Model(image_size=cfg["image_size"], max_actors=cfg["max_actors"],
+                     use_mask_structure=args.use_mask_structure).to(device)
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt, strict=False)
