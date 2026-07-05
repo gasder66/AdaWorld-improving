@@ -87,11 +87,17 @@ def main():
         shard_mode = False
     print(f"  Train: {len(train_dataset)} samples" + (" (shard)" if shard_mode else ""))
 
-    # Pre-load all data into memory for fast training.
+    # Pre-load and pre-stack all data into a single batched dict for instant indexing.
     if not shard_mode:
-        print(f"  Pre-loading {len(train_files)} files into memory...")
-        cache = [torch.load(f, map_location="cpu", weights_only=False) for f in train_files]
-        print(f"  Memory cache ready ({len(cache)} samples)")
+        print(f"  Pre-loading {len(train_files)} files...")
+        all_samples = [torch.load(f, map_location="cpu", weights_only=False) for f in train_files]
+        # Pre-stack into one big dict (one-time cost, eliminates per-step torch.stack).
+        cache = {}
+        for k in all_samples[0]:
+            if isinstance(all_samples[0][k], torch.Tensor):
+                cache[k] = torch.stack([s[k] for s in all_samples], dim=0)
+        print(f"  Pre-stacked cache ready: {list(cache.keys())}")
+        del all_samples
     else:
         cache = None
 
@@ -114,17 +120,20 @@ def main():
     while step < args.steps:
         if shard_mode:
             indices = torch.randperm(len(train_dataset))[:args.batch_size]
-            batch_list = [train_dataset[int(i)] for i in indices]
+            batch = train_dataset.get_batch(indices)
         elif cache is not None:
-            indices = torch.randperm(len(cache))[:args.batch_size]
-            batch_list = [cache[int(i)] for i in indices]
+            N = cache["video"].shape[0]
+            indices = torch.randperm(N)[:args.batch_size]
+            batch = {k: v.index_select(0, indices).to(device) for k, v in cache.items()}
         else:
             indices = torch.randperm(len(train_files))[:args.batch_size]
             batch_list = [torch.load(train_files[i], map_location="cpu", weights_only=False) for i in indices]
-        batch = collate(batch_list)
-        for k in list(batch.keys()):
-            if isinstance(batch[k], torch.Tensor):
-                batch[k] = batch[k].to(device)
+            batch = collate(batch_list)
+
+        if cache is None:
+            for k in list(batch.keys()):
+                if isinstance(batch[k], torch.Tensor):
+                    batch[k] = batch[k].to(device)
 
         out = model(batch, phase=args.phase)
         loss = out["loss"]
