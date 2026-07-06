@@ -1,5 +1,10 @@
 """
-BridgeBench Shard Dataset — pre-concatenate all shards, index_select for O(1) batching.
+BridgeBench Shard Dataset — GPU-resident for max training speed.
+Loads all shards to GPU once. index_select on GPU is O(1).
+
+Usage with run_v14.py --use_shards:
+  Shards are loaded, concatenated, and moved to GPU once (~30s).
+  Subsequent get_batch() uses GPU index_select (instant).
 """
 import json, os
 from typing import Dict
@@ -17,6 +22,7 @@ class BridgeBenchShardDataset(Dataset):
             meta = json.load(f)
         self.shard_dir = shard_dir
         self.shard_files = meta[split]["shard_files"]
+        self.shard_size = meta[split]["shard_size"]
         self.total = meta[split]["total"]
         self._data = None
 
@@ -24,8 +30,7 @@ class BridgeBenchShardDataset(Dataset):
         return self.total
 
     def _ensure_loaded(self):
-        if self._data is not None:
-            return
+        if self._data is not None: return
         print(f"  Loading {len(self.shard_files)} shards...", end="", flush=True)
         all_data = {}
         for sf in self.shard_files:
@@ -34,13 +39,12 @@ class BridgeBenchShardDataset(Dataset):
             for k, v in shard.items():
                 all_data.setdefault(k, []).append(v)
         self._data = {k: torch.cat(v, dim=0) for k, v in all_data.items()}
-        print(f" done ({list(self._data.keys())})")
+        print(f" done ({sum(v.numel()*v.element_size() for v in self._data.values())/1e6:.0f}MB)")
 
     def __getitem__(self, idx: int) -> Dict:
         self._ensure_loaded()
         return {k: v[idx] for k, v in self._data.items()}
 
     def get_batch(self, indices: torch.Tensor) -> Dict:
-        """Return batch dict by index_select (no stacking needed)."""
         self._ensure_loaded()
         return {k: v.index_select(0, indices) for k, v in self._data.items()}

@@ -147,10 +147,28 @@ def _generate_sample(bank_objects, rng, image_size, num_objects, T, step_size):
     return sample
 
 
-def _generate_sample_occlusion(bank_objects, rng, image_size, num_objects, T, step_size):
-    """Bridge-2: real objects with occlusion via depth-order layering."""
+def _generate_sample_occlusion(bank_objects, rng, image_size, num_objects, T, step_size,
+                                occlusion_level="mid"):
+    """Bridge-2: real objects with occlusion via depth-order layering.
+
+    occlusion_level presets:
+      light:  init_offset=0.25, step=8  → ~20% occ
+      mid:    init_offset=0.15, step=12 → ~40% occ
+      hard:   init_offset=0.08, step=16 → ~60% occ
+      extreme: init_offset=0.03, step=20 → ~75% occ
+    """
     H = W = image_size
     cs = bank_objects[0]["image_crop"].shape[1]
+
+    level_presets = {
+        "light":   {"offset": 0.25, "step": 8},
+        "mid":     {"offset": 0.15, "step": 12},
+        "hard":    {"offset": 0.08, "step": 16},
+        "extreme": {"offset": 0.03, "step": 20},
+    }
+    preset = level_presets.get(occlusion_level, level_presets["mid"])
+    init_offset = preset["offset"] * W
+    step = preset["step"]
 
     # Pick K random objects.
     cats = list(set(o["category"] for o in bank_objects))
@@ -166,7 +184,7 @@ def _generate_sample_occlusion(bank_objects, rng, image_size, num_objects, T, st
     # Assign positions — clustered for occlusion.
     positions = np.zeros((T, num_objects, 2), dtype=np.float32)
     base_cx, base_cy = W * 0.45, H * 0.45
-    offsets = [(0, 0), (W * 0.15, 0), (0, H * 0.15), (W * 0.12, H * 0.12)]
+    offsets = [(0, 0), (init_offset, 0), (0, init_offset), (init_offset * 0.8, init_offset * 0.8)]
     for k in range(min(num_objects, 4)):
         positions[0, k] = [base_cx + offsets[k][0], base_cy + offsets[k][1]]
 
@@ -181,7 +199,6 @@ def _generate_sample_occlusion(bank_objects, rng, image_size, num_objects, T, st
         for t in range(1, T):
             act = rng.randint(0, 5)
             actions[t - 1, k] = act
-            step = 12  # larger step for bridge2 occlusion
             dx, dy = ACTION_DELTA[act]
             px += dx * step; py += dy * step
             px = max(0, min(W - 1, px)); py = max(0, min(H - 1, py))
@@ -353,6 +370,9 @@ def main():
     parser.add_argument("--no_occlusion", action="store_true")
     parser.add_argument("--bridge", default="bridge1", choices=["bridge1", "bridge2_occlusion"],
                         help="Bridge variant: bridge1 (no occlusion) or bridge2_occlusion")
+    parser.add_argument("--occlusion_level", default="mid",
+                        choices=["light", "mid", "hard", "extreme"],
+                        help="Occlusion severity level (for bridge2_occlusion)")
     parser.add_argument("--max_slots", type=int, default=None,
                         help="Pad to K_max slots with valid=False (default: same as num_objects)")
     args = parser.parse_args()
@@ -380,7 +400,8 @@ def main():
         for i in range(n):
             if args.bridge == "bridge2_occlusion":
                 sample = _generate_sample_occlusion(bank, rng, args.image_size, args.num_objects,
-                                                    args.T, args.step_size)
+                                                    args.T, args.step_size,
+                                                    occlusion_level=args.occlusion_level)
             else:
                 sample = _generate_sample(bank, rng, args.image_size, args.num_objects,
                                           args.T, args.step_size)
