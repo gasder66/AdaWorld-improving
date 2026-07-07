@@ -168,7 +168,8 @@ def _generate_sample_occlusion(bank_objects, rng, image_size, num_objects, T, st
     }
     preset = level_presets.get(occlusion_level, level_presets["mid"])
     init_offset = preset["offset"] * W
-    step = preset["step"]
+    # If step_size is explicitly provided (not default 8), use it instead of preset.
+    step = step_size if step_size > 0 and step_size != 8 else preset["step"]
 
     # Pick K random objects.
     cats = list(set(o["category"] for o in bank_objects))
