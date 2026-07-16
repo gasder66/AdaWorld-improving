@@ -231,7 +231,7 @@ def _make_sample(
     boxes = np.asarray([[fighter.bbox_xyxy for fighter in state.fighters] for state in states], dtype=np.float32)
     centers = np.asarray([[fighter.center_xy for fighter in state.fighters] for state in states], dtype=np.float32)
     ram_boxes = np.asarray([[fighter.ram_bbox_xywh for fighter in state.fighters] for state in states], dtype=np.float32)
-    arm_lengths = np.asarray([state.arm_lengths for state in states], dtype=np.int16)
+    arm_lengths = np.asarray([state.arm_lengths for state in states], dtype=np.int16).reshape(len(states), 2, 2)
     scores = np.asarray([state.scores for state in states], dtype=np.int16)
     delta_xy = centers[1:] - centers[:-1]
     movement = np.zeros(delta_xy.shape[:2], dtype=np.int64)
@@ -251,7 +251,9 @@ def _make_sample(
         "actions": torch.from_numpy(movement),
         "env_actions": torch.tensor(transition_actions, dtype=torch.long),
         "arm_lengths": torch.from_numpy(arm_lengths),
-        "punch_labels": torch.from_numpy((arm_lengths != 0).astype(np.uint8)),
+        "punch_labels": torch.from_numpy(np.any(arm_lengths != 0, axis=-1).astype(np.uint8)),
+        "contact_labels": torch.zeros(len(states), dtype=torch.uint8),
+        "occlusion_labels": torch.zeros((len(states), 2), dtype=torch.uint8),
         "scores": torch.from_numpy(scores),
         "valid_mask": torch.ones((len(states), 2), dtype=torch.bool),
         "track_ids": torch.tensor([0, 1], dtype=torch.long),
