@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
+import subprocess
 import sys
 from typing import Dict
 
@@ -14,6 +16,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../
 from lam.datasets.boxing_object_dataset import BoxingObjectDataset
 from lam.datasets.boxing_transition_dataset import BoxingTransitionDataset
 from lam.modules.v16_boxing_model import BoxingObjectLAM
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _write_experiment_manifest(output: str, manifest: Dict) -> None:
+    os.makedirs(output, exist_ok=True)
+    with open(os.path.join(output, "experiment.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
 
 
 @torch.no_grad()
@@ -97,6 +114,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--transition_gap", type=int, choices=[1, 4], default=4)
     args = parser.parse_args()
+    manifest = {
+        "experiment": os.path.basename(os.path.normpath(args.output)),
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git_commit(),
+        "command": [sys.executable, *sys.argv],
+        "args": vars(args),
+    }
+    _write_experiment_manifest(args.output, manifest)
     torch.manual_seed(args.seed)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     train_sampler = None
@@ -178,6 +204,12 @@ def main() -> None:
     torch.save({"model": model.state_dict(), "args": vars(args)}, os.path.join(args.output, "model.pt"))
     with open(os.path.join(args.output, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump({"args": vars(args), "history": history, "ablation": metrics}, f, indent=2)
+    manifest.update(
+        status="complete",
+        completed_at=datetime.now(timezone.utc).isoformat(),
+        ablation=metrics,
+    )
+    _write_experiment_manifest(args.output, manifest)
     print(json.dumps(metrics, indent=2))
 
 
