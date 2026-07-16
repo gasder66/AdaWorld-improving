@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from typing import Dict, List, Sequence, Tuple
 
@@ -44,7 +45,14 @@ def _label_frame(frame: np.ndarray, lines: Sequence[str], scale: int = 3) -> np.
 
 def _write_video(frames: Sequence[np.ndarray], stem: str, fps: int) -> None:
     imageio.mimsave(stem + ".gif", list(frames), duration=1000 / fps, loop=0)
-    imageio.mimsave(stem + ".mp4", list(frames), fps=fps, codec="libx264", quality=8, pixelformat="yuv420p")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", stem + ".gif",
+            "-vf", f"fps={fps},scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "-c:v", "libx264", stem + ".mp4",
+        ],
+        check=True,
+    )
 
 
 def _net_displacement(sample: Dict[str, torch.Tensor]) -> np.ndarray:
