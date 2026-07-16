@@ -13,6 +13,7 @@ from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 from torch.utils.data import ConcatDataset, DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
@@ -94,6 +95,18 @@ def main() -> None:
         early_stopping=True, random_state=0,
     ).fit(train_scaled, train_active)
     active_mlp_prediction = active_mlp.predict(val_scaled)
+    rng = np.random.RandomState(0)
+    positive_indices = np.flatnonzero(train_active == 1)
+    negative_indices = np.flatnonzero(train_active == 0)
+    balanced_count = min(len(positive_indices), len(negative_indices), 6000)
+    svm_indices = np.concatenate([
+        rng.choice(positive_indices, balanced_count, replace=False),
+        rng.choice(negative_indices, balanced_count, replace=False),
+    ])
+    active_svm = SVC(C=3.0, kernel="rbf", gamma="scale", class_weight="balanced").fit(
+        train_scaled[svm_indices], train_active[svm_indices]
+    )
+    active_svm_prediction = active_svm.predict(val_scaled)
     arm_probe = Ridge(alpha=1.0).fit(train_scaled, train_arm)
     arm_prediction = arm_probe.predict(val_scaled)
     motion_probe = Ridge(alpha=1.0).fit(train_scaled, train_displacement)
@@ -106,6 +119,7 @@ def main() -> None:
         "punch_balanced_accuracy": float(balanced_accuracy_score(val_punch, punch_prediction)),
         "punch_active_linear_balanced_accuracy": float(balanced_accuracy_score(val_active, active_linear_prediction)),
         "punch_active_mlp_balanced_accuracy": float(balanced_accuracy_score(val_active, active_mlp_prediction)),
+        "punch_active_rbf_svm_balanced_accuracy": float(balanced_accuracy_score(val_active, active_svm_prediction)),
         "arm_delta_r2_left": float(r2_per_dim(val_arm, arm_prediction)[0]),
         "arm_delta_r2_right": float(r2_per_dim(val_arm, arm_prediction)[1]),
         "motion_r2_dx": float(r2_per_dim(val_displacement, motion_prediction)[0]),
