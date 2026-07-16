@@ -37,8 +37,14 @@ This file records milestone experiments for the V16 object-wise Boxing LAM. Indi
 
 - Purpose: increase genuinely distinct Player/Enemy onset, extend, hold, and switch transitions before adding interaction modeling.
 - Data selection: OCAtari labels filter generated clips; labels remain excluded from model inputs.
-- Planned outputs: `data/v16_boxing/targeted_punch_*`, `data/v16_boxing/transition_index_v2`, and `result/v16/v16_e03_targeted_punch`.
-- Acceptance targets: preserve normal < zero/shuffle for all phases; punch linear balanced accuracy >= 0.80; punch MLP >= 0.85; arm-delta R2 > 0.10 without materially reducing dx/dy R2.
+- Source commit: `640aab4`.
+- Data: `targeted_enemy_phases_v1`, `targeted_enemy_switch_v1`, and `transition_index_v2`.
+- Output: `result/v16/v16_e03_targeted_punch`.
+- Overall state MSE: normal `0.009029`, zero `0.025349`, genuine shuffle `0.024556`.
+- Original validation probe: linear `0.7202`, MLP `0.8192`, RBF-SVM `0.8048`; dx `0.8568`, dy `0.9766` R2.
+- Targeted Enemy probe: linear `0.8468`, MLP `0.8840`, RBF-SVM `0.9090`; arm-delta left `0.0294`, right `0.0685` R2.
+- Event ablation: normal beats zero and genuine shuffle for all six events, with 161 onset, 1,131 extend, 536 hold, 4,696 retract, and 289 switch validation transitions in the bounded evaluation.
+- Conclusion: rare-stage coverage and punch readability improved substantially without reducing the predictive need for matching latents. Fine-grained arm-extension geometry remains below the `0.10` R2 target, so E03 is a successful punch-detection baseline but not yet a complete phase-regression result.
 
 ### E04 — interaction Transformer
 
