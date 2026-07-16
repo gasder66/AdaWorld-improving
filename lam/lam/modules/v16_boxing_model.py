@@ -99,7 +99,8 @@ class BoxingObjectLAM(nn.Module):
         result = torch.empty_like(z)
         for k in range(z.shape[2]):
             flat = z[:, :, k].reshape(-1, z.shape[-1])
-            result[:, :, k] = flat.roll(1, dims=0).reshape_as(z[:, :, k])
+            shift = max(1, flat.shape[0] // 2)
+            result[:, :, k] = flat.roll(shift, dims=0).reshape_as(z[:, :, k])
         return result
 
     def _encode_slots(self, videos: Tensor, masks: Tensor, background_masks: Tensor) -> Tuple[Tensor, Tensor]:

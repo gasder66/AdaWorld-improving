@@ -83,6 +83,7 @@ def main() -> None:
     parser.add_argument("--transition_index_dir", default=None)
     parser.add_argument("--balanced_samples", type=int, default=0)
     parser.add_argument("--max_eval_batches", type=int, default=0)
+    parser.add_argument("--eval_batch_size", type=int, default=16)
     parser.add_argument("--output", default="result/v16/boxing_stage1_smoke")
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--pretrain_steps", type=int, default=200)
@@ -115,7 +116,7 @@ def main() -> None:
         train_ds, batch_size=args.batch_size, shuffle=train_sampler is None,
         sampler=train_sampler, num_workers=0, drop_last=True,
     )
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=0)
     model = BoxingObjectLAM(args.state_dim, args.latent_dim).to(device)
     if args.init_checkpoint:
         initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
