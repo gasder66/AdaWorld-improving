@@ -16,16 +16,26 @@ from lam.modules.v16_boxing_model import BoxingObjectLAM
 
 
 @torch.no_grad()
-def evaluate(model: BoxingObjectLAM, loader: DataLoader, device: torch.device) -> Dict[str, Dict[str, float]]:
+def _model_batch(batch: Dict[str, torch.Tensor], device: torch.device, transition_gap: int) -> Dict[str, torch.Tensor]:
+    result = {k: batch[k].to(device) for k in ("videos", "masks", "background_masks")}
+    if transition_gap > 1:
+        indices = torch.tensor([0, result["videos"].shape[1] - 1], device=device)
+        result = {key: value.index_select(1, indices) for key, value in result.items()}
+    return result
+
+
+def evaluate(
+    model: BoxingObjectLAM, loader: DataLoader, device: torch.device, transition_gap: int
+) -> Dict[str, Dict[str, float]]:
     model.eval()
     result: Dict[str, Dict[str, float]] = {}
     for ablation in ("normal", "zero", "shuffle"):
         sums: Dict[str, float] = {}
         count = 0
         for batch in loader:
-            model_batch = {k: batch[k].to(device) for k in ("videos", "masks", "background_masks")}
+            model_batch = _model_batch(batch, device, transition_gap)
             out = model(model_batch, ablation=ablation)
-            for key in ("loss", "state_loss", "reconstruction_loss", "object_rgb_loss"):
+            for key in ("loss", "state_loss", "identity_state_loss", "reconstruction_loss", "object_rgb_loss", "z_variance"):
                 sums[key] = sums.get(key, 0.0) + float(out[key])
             count += 1
         result[ablation] = {key: value / max(1, count) for key, value in sums.items()}
@@ -45,6 +55,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--transition_gap", type=int, choices=[1, 4], default=4)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -63,7 +74,7 @@ def main() -> None:
         except StopIteration:
             iterator = iter(train_loader)
             batch = next(iterator)
-        model_batch = {k: batch[k].to(device) for k in ("videos", "masks", "background_masks")}
+        model_batch = _model_batch(batch, device, args.transition_gap)
         out = model(model_batch)
         optimizer.zero_grad(set_to_none=True)
         out["loss"].backward()
@@ -73,7 +84,7 @@ def main() -> None:
         history.append(row)
         if step % 20 == 0 or step + 1 == args.steps:
             print(f"step={step:04d} " + " ".join(f"{k}={v:.5f}" for k, v in row.items()))
-    metrics = evaluate(model, val_loader, device)
+    metrics = evaluate(model, val_loader, device, args.transition_gap)
     os.makedirs(args.output, exist_ok=True)
     torch.save({"model": model.state_dict(), "args": vars(args)}, os.path.join(args.output, "model.pt"))
     with open(os.path.join(args.output, "metrics.json"), "w", encoding="utf-8") as f:

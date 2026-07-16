@@ -31,17 +31,14 @@ class PerObjectIDM(nn.Module):
             nn.Conv2d(state_dim * 3, state_dim, 1), nn.GELU(),
             nn.Conv2d(state_dim, state_dim, 3, padding=1), nn.GELU(),
         )
-        self.head = nn.Linear(state_dim, latent_dim * 2)
+        self.head = nn.Linear(state_dim, latent_dim)
 
     def forward(self, state_t: Tensor, state_tp1: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         delta = state_tp1 - state_t
         hidden = self.compare(torch.cat([state_t, state_tp1, delta], dim=1)).mean(dim=(-2, -1))
-        mu, logvar = self.head(hidden).chunk(2, dim=-1)
-        logvar = logvar.clamp(-6.0, 2.0)
-        if self.training:
-            z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
-        else:
-            z = mu
+        mu = self.head(hidden)
+        logvar = torch.zeros_like(mu)
+        z = mu
         return z, mu, logvar
 
 
@@ -50,15 +47,19 @@ class IndependentObjectFDM(nn.Module):
 
     def __init__(self, state_dim: int, latent_dim: int) -> None:
         super().__init__()
-        self.z_up = nn.Linear(latent_dim, state_dim)
+        self.state_norm = nn.GroupNorm(8, state_dim)
+        self.z_up = nn.Linear(latent_dim, state_dim * 2)
         self.transition = nn.Sequential(
             nn.Conv2d(state_dim * 2, state_dim, 3, padding=1), nn.GELU(),
             nn.Conv2d(state_dim, state_dim, 3, padding=1),
         )
 
     def forward(self, state_t: Tensor, z: Tensor) -> Tensor:
-        z_map = self.z_up(z).unsqueeze(-1).unsqueeze(-1).expand_as(state_t)
-        return state_t + self.transition(torch.cat([state_t, z_map], dim=1))
+        gamma, beta = self.z_up(z).chunk(2, dim=-1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        modulated = self.state_norm(state_t) * (1.0 + gamma) + beta
+        return state_t + self.transition(torch.cat([state_t, modulated], dim=1))
 
 
 class SlotDecoder(nn.Module):
@@ -180,7 +181,11 @@ class BoxingObjectLAM(nn.Module):
         ).sum(dim=(-3, -2, -1)).div(3.0 * bg_den).mean()
         reconstruction_loss = (reconstruction - target_video).abs().mean()
         kl = 0.5 * (mu.square() + logvar.exp() - logvar - 1.0).mean()
-        z_variance = mu.reshape(-1, self.latent_dim).var(dim=0, unbiased=False).mean()
+        z_flat = mu.reshape(-1, self.latent_dim)
+        z_std = z_flat.std(dim=0, unbiased=False)
+        z_variance = z_std.square().mean()
+        variance_floor_loss = F.relu(0.1 - z_std).mean()
+        identity_state_loss = F.mse_loss(state_t, state_tp1.detach())
         total = (
             state_loss
             + object_rgb_loss
@@ -188,7 +193,7 @@ class BoxingObjectLAM(nn.Module):
             + 0.5 * dice
             + 0.25 * background_loss
             + 0.25 * reconstruction_loss
-            + 1e-4 * kl
+            + 0.1 * variance_floor_loss
         )
         return {
             "loss": total,
@@ -199,7 +204,9 @@ class BoxingObjectLAM(nn.Module):
             "background_loss": background_loss,
             "reconstruction_loss": reconstruction_loss,
             "kl_loss": kl,
+            "variance_floor_loss": variance_floor_loss,
             "z_variance": z_variance,
+            "identity_state_loss": identity_state_loss,
             "z": z,
             "z_mu": mu,
             "z_logvar": logvar,
