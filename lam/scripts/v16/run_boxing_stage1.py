@@ -8,7 +8,7 @@ import sys
 from typing import Dict
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
 from lam.datasets.boxing_object_dataset import BoxingObjectDataset
@@ -74,6 +74,8 @@ def evaluate(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", default="data/v16_boxing/stage1_movement")
+    parser.add_argument("--extra_data_root", default=None)
+    parser.add_argument("--init_checkpoint", default=None)
     parser.add_argument("--output", default="result/v16/boxing_stage1_smoke")
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--pretrain_steps", type=int, default=200)
@@ -89,11 +91,20 @@ def main() -> None:
     args = parser.parse_args()
     torch.manual_seed(args.seed)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    train_ds = BoxingObjectDataset(os.path.join(args.data_root, "train"), args.max_train_samples)
-    val_ds = BoxingObjectDataset(os.path.join(args.data_root, "val"), args.max_val_samples)
+    train_parts = [BoxingObjectDataset(os.path.join(args.data_root, "train"), args.max_train_samples, target_frames=5)]
+    val_parts = [BoxingObjectDataset(os.path.join(args.data_root, "val"), args.max_val_samples, target_frames=5)]
+    if args.extra_data_root:
+        train_parts.append(BoxingObjectDataset(os.path.join(args.extra_data_root, "train"), args.max_train_samples, target_frames=5))
+        val_parts.append(BoxingObjectDataset(os.path.join(args.extra_data_root, "val"), args.max_val_samples, target_frames=5))
+    train_ds = train_parts[0] if len(train_parts) == 1 else ConcatDataset(train_parts)
+    val_ds = val_parts[0] if len(val_parts) == 1 else ConcatDataset(val_parts)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     model = BoxingObjectLAM(args.state_dim, args.latent_dim).to(device)
+    if args.init_checkpoint:
+        initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        model.load_state_dict(initial["model"])
+        print(f"initialized from {args.init_checkpoint}")
     history = {"visual": [], "dynamics": []}
 
     _set_phase(model, "visual")
