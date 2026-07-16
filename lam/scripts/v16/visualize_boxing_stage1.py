@@ -182,15 +182,16 @@ def make_reconstruction_video(
     frames = []
     per_sample = []
     model.eval()
-    for dataset_index in indices:
-        sample = dataset[dataset_index]
-        endpoints = torch.tensor([0, sample["videos"].shape[0] - 1])
-        batch = {
-            "videos": sample["videos"].index_select(0, endpoints).unsqueeze(0).to(device),
-            "masks": sample["masks"].index_select(0, endpoints).unsqueeze(0).to(device),
-            "background_masks": sample["background_masks"].index_select(0, endpoints).unsqueeze(0).to(device),
-        }
-        outputs = {name: model(batch, ablation=name)["reconstruction"][0, 0].cpu() for name in ("normal", "zero", "shuffle")}
+    samples = [dataset[index] for index in indices]
+    endpoints = torch.tensor([0, samples[0]["videos"].shape[0] - 1])
+    batch = {
+        "videos": torch.stack([sample["videos"].index_select(0, endpoints) for sample in samples]).to(device),
+        "masks": torch.stack([sample["masks"].index_select(0, endpoints) for sample in samples]).to(device),
+        "background_masks": torch.stack([sample["background_masks"].index_select(0, endpoints) for sample in samples]).to(device),
+    }
+    all_outputs = {name: model(batch, ablation=name)["reconstruction"][:, 0].cpu() for name in ("normal", "zero", "shuffle")}
+    for batch_index, (dataset_index, sample) in enumerate(zip(indices, samples)):
+        outputs = {name: value[batch_index] for name, value in all_outputs.items()}
         images = {
             "current t": sample["videos"][0],
             "target t+4": sample["videos"][-1],
