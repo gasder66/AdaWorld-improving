@@ -299,8 +299,6 @@ def _make_sample(
     frame_start: int,
     action_meanings: Sequence[str],
     stage: str,
-    required_punch_actor: str,
-    required_punch_events: Sequence[str],
 ) -> Dict[str, Any]:
     frames = np.stack([state.frame for state in states])
     masks = np.stack([[fighter.mask for fighter in state.fighters] for state in states])
