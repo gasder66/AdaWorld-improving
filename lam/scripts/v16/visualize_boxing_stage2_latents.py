@@ -30,7 +30,7 @@ def _motion_name(dx: float, dy: float) -> str:
 
 @torch.no_grad()
 def collect(model, dataset, device):
-    loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     values = {key: [] for key in ("z", "next_arm", "arm_delta", "motion", "slot")}
     model.eval()
     for batch in loader:
