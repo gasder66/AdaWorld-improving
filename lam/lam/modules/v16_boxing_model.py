@@ -148,7 +148,7 @@ class BoxingObjectLAM(nn.Module):
             shuffled_prediction = self.fdm(flat_t, shuffled_z.reshape(-1, self.latent_dim)).reshape_as(state_t)
             shuffled_error = (shuffled_prediction - state_tp1.detach()).square().mean(dim=(-3, -2, -1))
             zero_error = (state_t - state_tp1.detach()).square().mean(dim=(-3, -2, -1))
-            margin = 5e-4
+            margin = 1e-3
             action_contrast_loss = (
                 F.relu(normal_error + margin - shuffled_error).mean()
                 + F.relu(normal_error + margin - zero_error).mean()
@@ -210,7 +210,7 @@ class BoxingObjectLAM(nn.Module):
             + 0.25 * background_loss
             + 0.25 * reconstruction_loss
             + 0.1 * variance_floor_loss
-            + 5.0 * action_contrast_loss
+            + 100.0 * action_contrast_loss
         )
         return {
             "loss": total,

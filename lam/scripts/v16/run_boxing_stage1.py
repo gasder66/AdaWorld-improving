@@ -80,7 +80,13 @@ def main() -> None:
         out["loss"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        row = {key: float(out[key].detach()) for key in ("loss", "state_loss", "reconstruction_loss", "object_rgb_loss", "z_variance")}
+        row = {
+            key: float(out[key].detach())
+            for key in (
+                "loss", "state_loss", "reconstruction_loss", "object_rgb_loss",
+                "z_variance", "variance_floor_loss", "action_contrast_loss",
+            )
+        }
         history.append(row)
         if step % 20 == 0 or step + 1 == args.steps:
             print(f"step={step:04d} " + " ".join(f"{k}={v:.5f}" for k, v in row.items()))
