@@ -23,7 +23,9 @@ from tqdm import tqdm
 ENV_NAME = "ALE/Boxing-v5"
 FIGHTER_NAMES = ("Player", "Enemy")
 FIGHTER_COLORS = ((214, 214, 214), (0, 0, 0))
-ARM_RAM_INDICES = (55, 57, 59, 61)
+# Keep both fighters in [left_arm, right_arm] order. OCAtari exposes Enemy
+# arms in the opposite source order (right=59, left=61).
+ARM_RAM_INDICES = (55, 57, 61, 59)
 SCORE_RAM_INDICES = (18, 19)
 
 
@@ -216,6 +218,31 @@ def _clip_is_stage1(
     return True, "accepted"
 
 
+def _clip_is_isolated_punch(
+    states: Sequence[FrameState],
+    *,
+    min_separation: float,
+    neutral_arm_value: int,
+) -> Tuple[bool, str]:
+    arm_values = np.asarray([state.arm_lengths for state in states], dtype=np.int16)
+    punch_active = arm_values != neutral_arm_value
+    if not punch_active.any():
+        return False, "no_punch"
+    if not np.any(arm_values[1:] != arm_values[:-1]):
+        return False, "no_punch_phase_change"
+    if any(state.scores != states[0].scores for state in states[1:]):
+        return False, "score_change"
+    for state in states:
+        a, b = (fighter.bbox_xyxy for fighter in state.fighters)
+        if _intersection_area(a, b) > 0:
+            return False, "bbox_overlap"
+        if _edge_distance(a, b) < min_separation:
+            return False, "too_close"
+        if np.logical_and(state.fighters[0].mask, state.fighters[1].mask).any():
+            return False, "mask_overlap"
+    return True, "accepted"
+
+
 def _make_sample(
     states: Sequence[FrameState],
     transition_actions: Sequence[int],
@@ -225,6 +252,7 @@ def _make_sample(
     episode_id: int,
     frame_start: int,
     action_meanings: Sequence[str],
+    stage: str,
 ) -> Dict[str, Any]:
     frames = np.stack([state.frame for state in states])
     masks = np.stack([[fighter.mask for fighter in state.fighters] for state in states])
@@ -232,6 +260,13 @@ def _make_sample(
     centers = np.asarray([[fighter.center_xy for fighter in state.fighters] for state in states], dtype=np.float32)
     ram_boxes = np.asarray([[fighter.ram_bbox_xywh for fighter in state.fighters] for state in states], dtype=np.float32)
     arm_lengths = np.asarray([state.arm_lengths for state in states], dtype=np.int16).reshape(len(states), 2, 2)
+    punch_active = np.any(arm_lengths != 0, axis=-1).astype(np.uint8)
+    punch_side = np.zeros((len(states), 2), dtype=np.int64)
+    left_active = arm_lengths[..., 0] != 0
+    right_active = arm_lengths[..., 1] != 0
+    punch_side[left_active] = 1
+    punch_side[right_active] = 2
+    punch_side[left_active & right_active] = 3
     scores = np.asarray([state.scores for state in states], dtype=np.int16)
     delta_xy = centers[1:] - centers[:-1]
     movement = np.zeros(delta_xy.shape[:2], dtype=np.int64)
@@ -251,7 +286,9 @@ def _make_sample(
         "actions": torch.from_numpy(movement),
         "env_actions": torch.tensor(transition_actions, dtype=torch.long),
         "arm_lengths": torch.from_numpy(arm_lengths),
-        "punch_labels": torch.from_numpy(np.any(arm_lengths != 0, axis=-1).astype(np.uint8)),
+        "punch_labels": torch.from_numpy(punch_active),
+        "punch_side_labels": torch.from_numpy(punch_side),
+        "arm_delta": torch.from_numpy(arm_lengths[1:] - arm_lengths[:-1]),
         "contact_labels": torch.zeros(len(states), dtype=torch.uint8),
         "occlusion_labels": torch.zeros((len(states), 2), dtype=torch.uint8),
         "scores": torch.from_numpy(scores),
@@ -261,7 +298,7 @@ def _make_sample(
         "object_types": torch.tensor([0, 1], dtype=torch.long),
         "ram": torch.from_numpy(np.stack([state.ram for state in states])),
         "metadata": {
-            "task_name": "OCAtari-Boxing-Stage1-Movement",
+            "task_name": f"OCAtari-Boxing-{stage}",
             "game_name": "boxing",
             "env_name": ENV_NAME,
             "split": split,
@@ -272,7 +309,7 @@ def _make_sample(
             "action_meanings": list(action_meanings),
             "mask_source": "exact_sprite_color_within_ocatari_vision_box",
             "bbox_role": "audit_only_not_model_state",
-            "stage": "movement_no_punch_no_contact_no_occlusion",
+            "stage": stage,
         },
     }
     return sample
@@ -300,6 +337,7 @@ def _generate_split(
     min_motion: float,
     neutral_arm_value: int,
     frameskip: int,
+    stage: str,
 ) -> Dict[str, Any]:
     OCAtari = _import_ocatari()
     env = OCAtari(ENV_NAME, mode="both", hud=False, obs_mode="ori", render_mode="rgb_array", frameskip=frameskip)
@@ -308,6 +346,7 @@ def _generate_split(
     os.makedirs(out_dir, exist_ok=True)
     action_meanings = list(env._env.unwrapped.get_action_meanings())
     movement_ids = _movement_action_ids(action_meanings)
+    fire_ids = [i for i, name in enumerate(action_meanings) if "FIRE" in name]
     noop_id = action_meanings.index("NOOP")
     obs, _ = env.reset(seed=seed)
     episode_id = 0
@@ -333,12 +372,19 @@ def _generate_split(
             frame_indices.append(global_frame)
             while len(states) >= num_frames and accepted < count:
                 candidate = states[:num_frames]
-                ok, reason = _clip_is_stage1(
-                    candidate,
-                    min_separation=min_separation,
-                    min_motion=min_motion,
-                    neutral_arm_value=neutral_arm_value,
-                )
+                if stage == "movement_no_punch_no_contact_no_occlusion":
+                    ok, reason = _clip_is_stage1(
+                        candidate,
+                        min_separation=min_separation,
+                        min_motion=min_motion,
+                        neutral_arm_value=neutral_arm_value,
+                    )
+                else:
+                    ok, reason = _clip_is_isolated_punch(
+                        candidate,
+                        min_separation=min_separation,
+                        neutral_arm_value=neutral_arm_value,
+                    )
                 if ok:
                     sample = _make_sample(
                         candidate,
@@ -348,6 +394,7 @@ def _generate_split(
                         episode_id=episode_id,
                         frame_start=frame_indices[0],
                         action_meanings=action_meanings,
+                        stage=stage,
                     )
                     torch.save(sample, os.path.join(out_dir, f"sample_{accepted:06d}.pt"))
                     accepted += 1
@@ -361,8 +408,12 @@ def _generate_split(
                 break
 
             if hold_remaining <= 0:
-                held_action = rng.choice(movement_ids)
-                hold_remaining = rng.randint(1, 4)
+                if stage == "isolated_punch_no_contact_no_occlusion" and fire_ids and rng.random() < 0.65:
+                    held_action = rng.choice(fire_ids)
+                    hold_remaining = rng.randint(1, 3)
+                else:
+                    held_action = rng.choice(movement_ids)
+                    hold_remaining = rng.randint(1, 4)
             action = held_action
             hold_remaining -= 1
             actions.append(action)
@@ -406,6 +457,11 @@ def main() -> None:
     parser.add_argument("--min_motion", type=float, default=0.5)
     parser.add_argument("--neutral_arm_value", type=int, default=0)
     parser.add_argument("--frameskip", type=int, default=1)
+    parser.add_argument(
+        "--stage",
+        choices=["movement_no_punch_no_contact_no_occlusion", "isolated_punch_no_contact_no_occlusion"],
+        default="movement_no_punch_no_contact_no_occlusion",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_root, exist_ok=True)
@@ -425,9 +481,10 @@ def main() -> None:
                 min_motion=args.min_motion,
                 neutral_arm_value=args.neutral_arm_value,
                 frameskip=args.frameskip,
+                stage=args.stage,
             )
         )
-    config = {**vars(args), "env_name": ENV_NAME, "stage": "movement_no_punch_no_contact_no_occlusion", "reports": reports}
+    config = {**vars(args), "env_name": ENV_NAME, "reports": reports}
     with open(os.path.join(args.out_root, "dataset_config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     print(json.dumps(config, indent=2))
