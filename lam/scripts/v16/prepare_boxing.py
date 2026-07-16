@@ -57,7 +57,10 @@ def _import_ocatari():
 
 
 def _rgb_frame(env: Any, obs: Any) -> np.ndarray:
-    frame = env.get_rgb_state() if hasattr(env, "get_rgb_state") else None
+    frame = None
+    if hasattr(env, "get_rgb_state"):
+        value = env.get_rgb_state
+        frame = value() if callable(value) else value
     if frame is None:
         frame = env.render()
     if frame is None:
@@ -248,7 +251,7 @@ def _make_sample(
         "actions": torch.from_numpy(movement),
         "env_actions": torch.tensor(transition_actions, dtype=torch.long),
         "arm_lengths": torch.from_numpy(arm_lengths),
-        "punch_labels": torch.from_numpy((arm_lengths != arm_lengths[0:1] * 0).astype(np.uint8)),
+        "punch_labels": torch.from_numpy((arm_lengths != 0).astype(np.uint8)),
         "scores": torch.from_numpy(scores),
         "valid_mask": torch.ones((len(states), 2), dtype=torch.bool),
         "track_ids": torch.tensor([0, 1], dtype=torch.long),
