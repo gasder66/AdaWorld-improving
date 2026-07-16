@@ -28,6 +28,7 @@ FIGHTER_COLORS = ((214, 214, 214), (0, 0, 0))
 ARM_RAM_INDICES = (55, 57, 61, 59)
 SCORE_RAM_INDICES = (18, 19)
 PUNCH_EVENT_NAMES = ("punch_onset", "punch_extend", "punch_hold", "punch_retract", "punch_switch")
+INTERACTION_EVENT_NAMES = ("near", "contact", "punch_miss", "hit", "occlusion", "recovery")
 
 
 @dataclass(frozen=True)
@@ -220,6 +221,83 @@ def _classify_punch_transition(previous: Sequence[int], current: Sequence[int]) 
     return "movement_only"
 
 
+def _interaction_labels(
+    states: Sequence[FrameState],
+    *,
+    near_distance: float,
+    occlusion_drop_ratio: float,
+    neutral_arm_value: int,
+) -> Dict[str, np.ndarray]:
+    """Derive evaluation-only interaction labels from oracle geometry and RAM."""
+    time = len(states)
+    boxes = [[fighter.bbox_xyxy for fighter in state.fighters] for state in states]
+    visible_pixels = np.asarray(
+        [[int(fighter.mask.sum()) for fighter in state.fighters] for state in states], dtype=np.int32
+    )
+    overlap_area = np.asarray([_intersection_area(pair[0], pair[1]) for pair in boxes], dtype=np.int32)
+    edge_distance = np.asarray([_edge_distance(pair[0], pair[1]) for pair in boxes], dtype=np.float32)
+    contact = overlap_area > 0
+    near = (edge_distance <= near_distance) & ~contact
+
+    occlusion = np.zeros((time, 2), dtype=np.uint8)
+    for t in range(1, time):
+        if not contact[t]:
+            continue
+        previous = np.maximum(visible_pixels[t - 1], 1)
+        occlusion[t] = (visible_pixels[t] < previous * (1.0 - occlusion_drop_ratio)).astype(np.uint8)
+
+    scores = np.asarray([state.scores for state in states], dtype=np.int16)
+    score_delta = scores[1:] - scores[:-1]
+    hit = np.any(score_delta != 0, axis=1).astype(np.uint8)
+    hit_actor = np.full(time - 1, -1, dtype=np.int64)
+    hit_receiver = np.full(time - 1, -1, dtype=np.int64)
+    for t in range(time - 1):
+        changed = np.flatnonzero(score_delta[t] != 0)
+        if len(changed):
+            actor = int(changed[0])
+            hit_actor[t] = actor
+            hit_receiver[t] = 1 - actor
+
+    arms = np.asarray([state.arm_lengths for state in states], dtype=np.int16).reshape(time, 2, 2)
+    punch_active = np.any(arms != neutral_arm_value, axis=-1)
+    close_transition = contact[:-1] | contact[1:] | near[:-1] | near[1:]
+    punch_miss = (
+        (punch_active[:-1] | punch_active[1:])
+        & close_transition[:, None]
+        & ~hit[:, None].astype(bool)
+    ).astype(np.uint8)
+    recovery = (contact[:-1] & ~contact[1:]).astype(np.uint8)
+    return {
+        "near_labels": near.astype(np.uint8),
+        "contact_labels": contact.astype(np.uint8),
+        "punch_miss_labels": punch_miss,
+        "hit_labels": hit,
+        "hit_actor": hit_actor,
+        "hit_receiver": hit_receiver,
+        "score_delta": score_delta,
+        "occlusion_labels": occlusion,
+        "recovery_labels": recovery,
+        "bbox_overlap_area": overlap_area,
+        "edge_distance": edge_distance,
+        "visible_pixels": visible_pixels,
+    }
+
+
+def _present_interaction_events(labels: Dict[str, np.ndarray]) -> set[str]:
+    present = set()
+    for event, key in (
+        ("near", "near_labels"),
+        ("contact", "contact_labels"),
+        ("punch_miss", "punch_miss_labels"),
+        ("hit", "hit_labels"),
+        ("occlusion", "occlusion_labels"),
+        ("recovery", "recovery_labels"),
+    ):
+        if bool(np.asarray(labels[key]).any()):
+            present.add(event)
+    return present
+
+
 def _clip_is_stage1(
     states: Sequence[FrameState],
     *,
@@ -289,6 +367,34 @@ def _clip_is_isolated_punch(
     return True, "accepted"
 
 
+def _clip_is_interaction(
+    states: Sequence[FrameState],
+    *,
+    near_distance: float,
+    occlusion_drop_ratio: float,
+    neutral_arm_value: int,
+    required_interaction_events: Sequence[str],
+    required_hit_actor: str,
+) -> Tuple[bool, str]:
+    labels = _interaction_labels(
+        states,
+        near_distance=near_distance,
+        occlusion_drop_ratio=occlusion_drop_ratio,
+        neutral_arm_value=neutral_arm_value,
+    )
+    present = _present_interaction_events(labels)
+    requested = set(required_interaction_events)
+    if requested and present.isdisjoint(requested):
+        return False, "missing_required_interaction_event"
+    if not requested and not present.intersection({"contact", "punch_miss", "hit", "occlusion", "recovery"}):
+        return False, "no_interaction"
+    if required_hit_actor != "any":
+        slot = 0 if required_hit_actor == "player" else 1
+        if not bool(np.any(labels["hit_actor"] == slot)):
+            return False, "missing_required_hit_actor"
+    return True, "accepted"
+
+
 def _make_sample(
     states: Sequence[FrameState],
     transition_actions: Sequence[int],
@@ -299,6 +405,9 @@ def _make_sample(
     frame_start: int,
     action_meanings: Sequence[str],
     stage: str,
+    near_distance: float,
+    occlusion_drop_ratio: float,
+    neutral_arm_value: int,
 ) -> Dict[str, Any]:
     frames = np.stack([state.frame for state in states])
     masks = np.stack([[fighter.mask for fighter in state.fighters] for state in states])
@@ -320,6 +429,12 @@ def _make_sample(
         for k in range(delta_xy.shape[1]):
             movement[t, k] = _movement_label(float(delta_xy[t, k, 0]), float(delta_xy[t, k, 1]))
     background = 1 - np.clip(masks.sum(axis=1), 0, 1)
+    interaction = _interaction_labels(
+        states,
+        near_distance=near_distance,
+        occlusion_drop_ratio=occlusion_drop_ratio,
+        neutral_arm_value=neutral_arm_value,
+    )
     sample = {
         "videos": torch.from_numpy(frames).permute(0, 3, 1, 2).contiguous(),
         "masks": torch.from_numpy(masks.astype(np.uint8)),
@@ -335,8 +450,7 @@ def _make_sample(
         "punch_labels": torch.from_numpy(punch_active),
         "punch_side_labels": torch.from_numpy(punch_side),
         "arm_delta": torch.from_numpy(arm_lengths[1:] - arm_lengths[:-1]),
-        "contact_labels": torch.zeros(len(states), dtype=torch.uint8),
-        "occlusion_labels": torch.zeros((len(states), 2), dtype=torch.uint8),
+        **{key: torch.from_numpy(value) for key, value in interaction.items()},
         "scores": torch.from_numpy(scores),
         "valid_mask": torch.ones((len(states), 2), dtype=torch.bool),
         "track_ids": torch.tensor([0, 1], dtype=torch.long),
@@ -356,6 +470,7 @@ def _make_sample(
             "mask_source": "exact_sprite_color_within_ocatari_vision_box",
             "bbox_role": "audit_only_not_model_state",
             "stage": stage,
+            "interaction_events": sorted(_present_interaction_events(interaction)),
         },
     }
     return sample
@@ -386,6 +501,10 @@ def _generate_split(
     stage: str,
     required_punch_actor: str,
     required_punch_events: Sequence[str],
+    required_interaction_events: Sequence[str],
+    required_hit_actor: str,
+    near_distance: float,
+    occlusion_drop_ratio: float,
 ) -> Dict[str, Any]:
     OCAtari = _import_ocatari()
     env = OCAtari(ENV_NAME, mode="both", hud=False, obs_mode="ori", render_mode="rgb_array", frameskip=frameskip)
@@ -427,13 +546,22 @@ def _generate_split(
                         min_motion=min_motion,
                         neutral_arm_value=neutral_arm_value,
                     )
-                else:
+                elif stage == "isolated_punch_no_contact_no_occlusion":
                     ok, reason = _clip_is_isolated_punch(
                         candidate,
                         min_separation=min_separation,
                         neutral_arm_value=neutral_arm_value,
                         required_punch_actor=required_punch_actor,
                         required_punch_events=required_punch_events,
+                    )
+                else:
+                    ok, reason = _clip_is_interaction(
+                        candidate,
+                        near_distance=near_distance,
+                        occlusion_drop_ratio=occlusion_drop_ratio,
+                        neutral_arm_value=neutral_arm_value,
+                        required_interaction_events=required_interaction_events,
+                        required_hit_actor=required_hit_actor,
                     )
                 if ok:
                     sample = _make_sample(
@@ -445,6 +573,9 @@ def _generate_split(
                         frame_start=frame_indices[0],
                         action_meanings=action_meanings,
                         stage=stage,
+                        near_distance=near_distance,
+                        occlusion_drop_ratio=occlusion_drop_ratio,
+                        neutral_arm_value=neutral_arm_value,
                     )
                     torch.save(sample, os.path.join(out_dir, f"sample_{accepted:06d}.pt"))
                     accepted += 1
@@ -458,7 +589,7 @@ def _generate_split(
                 break
 
             if hold_remaining <= 0:
-                if stage == "isolated_punch_no_contact_no_occlusion" and fire_ids and rng.random() < 0.65:
+                if stage in {"isolated_punch_no_contact_no_occlusion", "interaction"} and fire_ids and rng.random() < 0.65:
                     held_action = rng.choice(fire_ids)
                     hold_remaining = rng.randint(1, 3)
                 else:
@@ -507,6 +638,8 @@ def main() -> None:
     parser.add_argument("--min_motion", type=float, default=0.5)
     parser.add_argument("--neutral_arm_value", type=int, default=0)
     parser.add_argument("--frameskip", type=int, default=1)
+    parser.add_argument("--near_distance", type=float, default=6.0)
+    parser.add_argument("--occlusion_drop_ratio", type=float, default=0.15)
     parser.add_argument(
         "--required_punch_actor",
         choices=["any", "player", "enemy"],
@@ -521,8 +654,21 @@ def main() -> None:
         help="Optional isolated-punch phase filter. Labels are used only for data selection/evaluation.",
     )
     parser.add_argument(
+        "--required_hit_actor",
+        choices=["any", "player", "enemy"],
+        default="any",
+        help="For interaction data, retain only clips where this fighter scores a hit.",
+    )
+    parser.add_argument(
+        "--required_interaction_events",
+        nargs="*",
+        choices=INTERACTION_EVENT_NAMES,
+        default=[],
+        help="For interaction data, retain clips containing at least one requested event.",
+    )
+    parser.add_argument(
         "--stage",
-        choices=["movement_no_punch_no_contact_no_occlusion", "isolated_punch_no_contact_no_occlusion"],
+        choices=["movement_no_punch_no_contact_no_occlusion", "isolated_punch_no_contact_no_occlusion", "interaction"],
         default="movement_no_punch_no_contact_no_occlusion",
     )
     args = parser.parse_args()
@@ -547,6 +693,10 @@ def main() -> None:
                 stage=args.stage,
                 required_punch_actor=args.required_punch_actor,
                 required_punch_events=args.required_punch_events,
+                required_interaction_events=args.required_interaction_events,
+                required_hit_actor=args.required_hit_actor,
+                near_distance=args.near_distance,
+                occlusion_drop_ratio=args.occlusion_drop_ratio,
             )
         )
     config = {**vars(args), "env_name": ENV_NAME, "reports": reports}

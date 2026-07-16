@@ -99,6 +99,7 @@ def main() -> None:
     parser.add_argument("--init_checkpoint", default=None)
     parser.add_argument("--transition_index_dir", default=None)
     parser.add_argument("--balanced_samples", type=int, default=0)
+    parser.add_argument("--balance_mode", choices=["phase", "interaction"], default="phase")
     parser.add_argument("--max_eval_batches", type=int, default=0)
     parser.add_argument("--eval_batch_size", type=int, default=16)
     parser.add_argument("--output", default="result/v16/boxing_stage1_smoke")
@@ -109,11 +110,16 @@ def main() -> None:
     parser.add_argument("--max_val_samples", type=int, default=16)
     parser.add_argument("--state_dim", type=int, default=96)
     parser.add_argument("--latent_dim", type=int, default=16)
+    parser.add_argument(
+        "--fdm_type", choices=["independent", "interaction", "spatial_interaction"], default="independent"
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--transition_gap", type=int, choices=[1, 4], default=4)
     args = parser.parse_args()
+    if args.transition_index_dir and args.batch_size < 2:
+        raise ValueError("transition-balanced training requires batch_size >= 2 for genuine same-object shuffle")
     manifest = {
         "experiment": os.path.basename(os.path.normpath(args.output)),
         "status": "running",
@@ -129,7 +135,7 @@ def main() -> None:
     if args.transition_index_dir:
         train_ds = BoxingTransitionDataset(os.path.join(args.transition_index_dir, "train.pt"))
         val_ds = BoxingTransitionDataset(os.path.join(args.transition_index_dir, "val.pt"))
-        train_sampler = train_ds.balanced_sampler(args.balanced_samples or None, args.seed)
+        train_sampler = train_ds.balanced_sampler(args.balanced_samples or None, args.seed, args.balance_mode)
     else:
         train_parts = [BoxingObjectDataset(os.path.join(args.data_root, "train"), args.max_train_samples, target_frames=5)]
         val_parts = [BoxingObjectDataset(os.path.join(args.data_root, "val"), args.max_val_samples, target_frames=5)]
@@ -143,10 +149,27 @@ def main() -> None:
         sampler=train_sampler, num_workers=0, drop_last=True,
     )
     val_loader = DataLoader(val_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=0)
-    model = BoxingObjectLAM(args.state_dim, args.latent_dim).to(device)
+    model = BoxingObjectLAM(args.state_dim, args.latent_dim, args.fdm_type).to(device)
     if args.init_checkpoint:
         initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
-        model.load_state_dict(initial["model"])
+        source_type = initial.get("args", {}).get("fdm_type", "independent")
+        if source_type == args.fdm_type:
+            model.load_state_dict(initial["model"])
+        else:
+            compatible = {}
+            target_state = model.state_dict()
+            for key, value in initial["model"].items():
+                target_key = key
+                if source_type == "independent" and args.fdm_type in {"interaction", "spatial_interaction"} and key.startswith("fdm."):
+                    target_key = "fdm.base." + key[len("fdm."):]
+                if target_key in target_state and target_state[target_key].shape == value.shape:
+                    compatible[target_key] = value
+            missing, unexpected = model.load_state_dict(compatible, strict=False)
+            print(
+                f"initialized shared modules from {source_type} checkpoint; "
+                f"new {args.fdm_type} FDM parameters={len([key for key in missing if key.startswith('fdm.')])}, "
+                f"unexpected={len(unexpected)}"
+            )
         print(f"initialized from {args.init_checkpoint}")
     history = {"visual": [], "dynamics": []}
 

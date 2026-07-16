@@ -48,5 +48,12 @@ This file records milestone experiments for the V16 object-wise Boxing LAM. Indi
 
 ### E04 — interaction Transformer
 
-- Start only after E03 produces a stable independent-FDM baseline.
-- Compare independent FDM with a two-fighter Transformer on contact, hit, and occlusion subsets.
+- Data protocol: `interaction_general_v1`, balanced `interaction_hit_player_v1` / `interaction_hit_enemy_v1`, `interaction_occlusion_v1`, and `transition_index_v3`.
+- Validation coverage: 314 hit, 314 received-hit, 299 occlusion, 600 contact, and 600 recovery target transitions in the bounded comparison.
+- `v16_e04b_interaction_independent`: overall state MSE `0.009747`.
+- Replacement Transformer (`v16_e04b_interaction_transformer`) failed: overall state MSE `0.012588` and worse results in every event class. It is retained only as a negative experiment.
+- Residual Transformer (`v16_e04c_residual_transformer`) preserves the pretrained independent FDM and learns a two-token interaction correction. Overall state MSE is `0.009534`, with normal/zero/shuffle at `0.009534` / `0.025162` / `0.025321`.
+- Relative to the same-data independent baseline, the residual Transformer improves non-interaction `2.0%`, contact `1.9%`, hit `4.5%`, received-hit `2.5%`, occlusion `3.4%`, and recovery `2.0%`.
+- Original punch probe remains stable: linear `0.7550`, MLP `0.8096`, RBF-SVM `0.8093`; dx `0.8836`, dy `0.9785` R2.
+- Opponent-state masking raises target error most for hit and occlusion, but opponent-state shuffling is nearly neutral. Current evidence supports a small generic cross-object context benefit, not yet strong matching-specific interaction.
+- A position-aware visual-token variant is implemented as `spatial_interaction` but remains untrained. A batch-size guard now prevents transition training with batch `< 2`, because genuine same-object shuffle is impossible with one transition per object.

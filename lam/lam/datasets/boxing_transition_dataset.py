@@ -26,6 +26,28 @@ DEFAULT_EVENT_PROBABILITIES = {
     "punch_switch": 0.05,
 }
 
+INTERACTION_TO_ID = {
+    "non_interaction": 0,
+    "near": 1,
+    "contact": 2,
+    "punch_miss": 3,
+    "hit": 4,
+    "received_hit": 5,
+    "occlusion": 6,
+    "recovery": 7,
+}
+
+DEFAULT_INTERACTION_PROBABILITIES = {
+    "non_interaction": 0.25,
+    "near": 0.10,
+    "contact": 0.10,
+    "punch_miss": 0.15,
+    "hit": 0.10,
+    "received_hit": 0.15,
+    "occlusion": 0.10,
+    "recovery": 0.05,
+}
+
 
 class BoxingTransitionDataset(Dataset):
     def __init__(self, index_path: str) -> None:
@@ -58,17 +80,38 @@ class BoxingTransitionDataset(Dataset):
             "arm_delta": arms[1:] - arms[:-1],
             "punch_labels": (arms != 0).any(dim=-1).long(),
             "event_id": EVENT_TO_ID[entry["event"]],
+            "interaction_id": INTERACTION_TO_ID[entry.get("interaction_primary", "non_interaction")],
             "target_slot": int(entry["target_slot"]),
             "sample_index": index,
         }
 
-    def balanced_sampler(self, num_samples: int | None = None, seed: int = 0) -> WeightedRandomSampler:
-        tuple_counts = Counter((entry["event"], entry["fighter"]) for entry in self.entries)
+    def balanced_sampler(
+        self, num_samples: int | None = None, seed: int = 0, mode: str = "phase"
+    ) -> WeightedRandomSampler:
+        if mode == "phase":
+            key_name = "event"
+            probabilities = DEFAULT_EVENT_PROBABILITIES
+            balance_fighter = True
+        elif mode == "interaction":
+            key_name = "interaction_primary"
+            probabilities = DEFAULT_INTERACTION_PROBABILITIES
+            # Occlusion is asymmetric in the Atari renderer (the black sprite
+            # is usually hidden), so forcing 50/50 fighter balance would repeat
+            # a tiny set of rare Player-occlusion transitions.
+            balance_fighter = False
+        else:
+            raise ValueError(f"unknown balance mode: {mode}")
+        if balance_fighter:
+            counts = Counter((entry.get(key_name, "non_interaction"), entry["fighter"]) for entry in self.entries)
+        else:
+            counts = Counter(entry.get(key_name, "non_interaction") for entry in self.entries)
         weights = []
         for entry in self.entries:
-            event = entry["event"]
-            target_probability = DEFAULT_EVENT_PROBABILITIES[event] * 0.5
-            weights.append(target_probability / tuple_counts[(event, entry["fighter"])])
+            event = entry.get(key_name, "non_interaction")
+            if balance_fighter:
+                weights.append(probabilities[event] * 0.5 / counts[(event, entry["fighter"])])
+            else:
+                weights.append(probabilities[event] / counts[event])
         generator = torch.Generator().manual_seed(seed)
         return WeightedRandomSampler(
             torch.tensor(weights, dtype=torch.double),

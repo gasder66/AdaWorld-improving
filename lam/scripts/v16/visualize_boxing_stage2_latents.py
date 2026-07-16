@@ -83,7 +83,9 @@ def main() -> None:
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint["args"]
-    model = BoxingObjectLAM(config["state_dim"], config["latent_dim"]).to(device)
+    model = BoxingObjectLAM(
+        config["state_dim"], config["latent_dim"], config.get("fdm_type", "independent")
+    ).to(device)
     model.load_state_dict(checkpoint["model"])
     dataset = ConcatDataset([
         BoxingObjectDataset(os.path.join(args.movement_root, "val"), target_frames=5),

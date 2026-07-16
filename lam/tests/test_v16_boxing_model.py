@@ -6,15 +6,19 @@ from lam.modules.v16_boxing_model import BoxingObjectLAM
 
 
 class BoxingObjectLAMTest(unittest.TestCase):
-    def test_shapes_and_object_specific_idm(self):
-        torch.manual_seed(0)
-        model = BoxingObjectLAM(state_dim=32, latent_dim=8).eval()
+    @staticmethod
+    def _batch():
         videos = torch.rand(2, 3, 3, 64, 48)
         masks = torch.zeros(2, 3, 2, 64, 48)
         masks[:, :, 0, 8:24, 4:12] = 1
         masks[:, :, 1, 36:52, 32:40] = 1
         background = 1 - masks.sum(dim=2)
-        batch = {"videos": videos, "masks": masks, "background_masks": background}
+        return {"videos": videos, "masks": masks, "background_masks": background}
+
+    def test_shapes_and_object_specific_idm(self):
+        torch.manual_seed(0)
+        model = BoxingObjectLAM(state_dim=32, latent_dim=8).eval()
+        batch = self._batch()
         with torch.no_grad():
             output = model(batch)
             zero_output = model(batch, ablation="zero")
@@ -34,6 +38,34 @@ class BoxingObjectLAMTest(unittest.TestCase):
         with torch.no_grad():
             changed_output = model(changed)
         self.assertTrue(torch.allclose(output["z"][:, :, 0], changed_output["z"][:, :, 0], atol=1e-6))
+
+    def test_interaction_fdm_and_opponent_ablation(self):
+        torch.manual_seed(1)
+        model = BoxingObjectLAM(state_dim=32, latent_dim=8, fdm_type="interaction").eval()
+        batch = self._batch()
+        with torch.no_grad():
+            normal = model(batch)
+            masked = model(batch, opponent_ablation="mask_state", target_slot=0)
+            shuffled = model(batch, opponent_ablation="shuffle_z", target_slot=0)
+        self.assertEqual(normal["predicted_object_states"].shape, (2, 2, 2, 32, 16, 12))
+        self.assertTrue(torch.isfinite(normal["loss"]))
+        self.assertFalse(
+            torch.allclose(
+                normal["predicted_object_states"][:, :, 0],
+                masked["predicted_object_states"][:, :, 0],
+            )
+        )
+
+        spatial_model = BoxingObjectLAM(state_dim=32, latent_dim=8, fdm_type="spatial_interaction").eval()
+        with torch.no_grad():
+            spatial_output = spatial_model(batch)
+        self.assertEqual(spatial_output["predicted_object_states"].shape, normal["predicted_object_states"].shape)
+        self.assertFalse(
+            torch.allclose(
+                normal["predicted_object_states"][:, :, 0],
+                shuffled["predicted_object_states"][:, :, 0],
+            )
+        )
 
 
 if __name__ == "__main__":

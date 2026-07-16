@@ -56,12 +56,109 @@ class IndependentObjectFDM(nn.Module):
             nn.Conv2d(state_dim, state_dim, 3, padding=1, bias=False),
         )
 
-    def forward(self, state_t: Tensor, z: Tensor) -> Tensor:
-        gamma, beta = self.z_up(z).chunk(2, dim=-1)
+    def forward(
+        self, state_t: Tensor, z: Tensor, opponent_ablation: str = "normal", target_slot: int | None = None
+    ) -> Tensor:
+        del opponent_ablation, target_slot
+        shape = state_t.shape
+        flat_state = state_t.reshape(-1, shape[-3], shape[-2], shape[-1])
+        flat_z = z.reshape(-1, z.shape[-1])
+        gamma, beta = self.z_up(flat_z).chunk(2, dim=-1)
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
         beta = beta.unsqueeze(-1).unsqueeze(-1)
-        modulated = self.state_norm(state_t) * gamma + beta
-        return state_t + self.transition(modulated)
+        modulated = self.state_norm(flat_state) * gamma + beta
+        return (flat_state + self.transition(modulated)).reshape(shape)
+
+
+class InteractionObjectFDM(nn.Module):
+    """Independent dynamics plus a small two-token interaction residual."""
+
+    def __init__(
+        self, state_dim: int, latent_dim: int, layers: int = 2, heads: int = 4,
+        spatial_tokens: bool = False,
+    ) -> None:
+        super().__init__()
+        self.spatial_tokens = spatial_tokens
+        self.base = IndependentObjectFDM(state_dim, latent_dim)
+        self.state_norm = nn.GroupNorm(8, state_dim)
+        self.state_token = nn.Linear(state_dim, state_dim, bias=False)
+        if spatial_tokens:
+            self.spatial_score = nn.Conv2d(state_dim, 1, 1)
+            self.position_token = nn.Linear(2, state_dim, bias=False)
+        self.z_token = nn.Linear(latent_dim, state_dim, bias=False)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=state_dim,
+            nhead=heads,
+            dim_feedforward=state_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.interaction = nn.TransformerEncoder(encoder_layer, num_layers=layers, enable_nested_tensor=False)
+        self.condition = nn.Linear(state_dim, state_dim * 2, bias=False)
+        self.transition = nn.Sequential(
+            nn.Conv2d(state_dim, state_dim, 3, padding=1, bias=False), nn.GELU(),
+            nn.Conv2d(state_dim, state_dim, 3, padding=1, bias=False),
+        )
+        nn.init.normal_(self.transition[-1].weight, mean=0.0, std=1e-3)
+
+    @staticmethod
+    def _intervene(value: Tensor, opponent: int, mode: str) -> Tensor:
+        result = value.clone()
+        if mode.startswith("mask_"):
+            result[:, opponent] = 0
+        elif mode.startswith("shuffle_"):
+            shift = max(1, value.shape[0] // 2)
+            result[:, opponent] = value[:, opponent].roll(shift, dims=0)
+        return result
+
+    def _visual_token(self, state_t: Tensor) -> Tensor:
+        batch, slots, channels, height, width = state_t.shape
+        if not self.spatial_tokens:
+            return self.state_token(state_t.mean(dim=(-2, -1)))
+        flat = state_t.reshape(batch * slots, channels, height, width)
+        weights = self.spatial_score(flat).flatten(2).softmax(dim=-1)
+        features = flat.flatten(2)
+        pooled = (features * weights).sum(dim=-1)
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, height, device=state_t.device, dtype=state_t.dtype),
+            torch.linspace(-1.0, 1.0, width, device=state_t.device, dtype=state_t.dtype),
+            indexing="ij",
+        )
+        coordinates = torch.stack([xx, yy], dim=0).reshape(1, 2, height * width)
+        position = (coordinates * weights).sum(dim=-1)
+        token = self.state_token(pooled) + self.position_token(position)
+        return token.reshape(batch, slots, channels)
+
+    def forward(
+        self, state_t: Tensor, z: Tensor, opponent_ablation: str = "normal", target_slot: int | None = None
+    ) -> Tensor:
+        # state_t [N,2,C,H,W], z [N,2,D]
+        if state_t.ndim != 5 or state_t.shape[1] != 2:
+            raise ValueError(f"interaction FDM expects [N,2,C,H,W], got {tuple(state_t.shape)}")
+        base_prediction = self.base(state_t, z)
+        visual_tokens = self._visual_token(state_t)
+        z_used = z
+        if opponent_ablation != "normal":
+            if target_slot not in (0, 1):
+                raise ValueError("target_slot must be 0 or 1 for opponent ablations")
+            opponent = 1 - int(target_slot)
+            if opponent_ablation in {"mask_state", "shuffle_state"}:
+                visual_tokens = self._intervene(visual_tokens, opponent, opponent_ablation)
+            elif opponent_ablation in {"mask_z", "shuffle_z"}:
+                z_used = self._intervene(z, opponent, opponent_ablation)
+            else:
+                raise ValueError(f"unknown opponent ablation: {opponent_ablation}")
+        tokens = visual_tokens + self.z_token(z_used)
+        mixed = self.interaction(tokens)
+        gamma, beta = self.condition(mixed).chunk(2, dim=-1)
+        flat_state = state_t.reshape(-1, *state_t.shape[-3:])
+        gamma = gamma.reshape(-1, gamma.shape[-1]).unsqueeze(-1).unsqueeze(-1)
+        beta = beta.reshape(-1, beta.shape[-1]).unsqueeze(-1).unsqueeze(-1)
+        modulated = self.state_norm(flat_state) * gamma + beta
+        correction = self.transition(modulated).reshape_as(state_t)
+        return base_prediction + correction
 
 
 class SlotDecoder(nn.Module):
@@ -82,14 +179,22 @@ class SlotDecoder(nn.Module):
 class BoxingObjectLAM(nn.Module):
     """Two dynamic fighter slots plus one action-free background slot."""
 
-    def __init__(self, state_dim: int = 96, latent_dim: int = 16) -> None:
+    def __init__(self, state_dim: int = 96, latent_dim: int = 16, fdm_type: str = "independent") -> None:
         super().__init__()
         self.state_dim = state_dim
         self.latent_dim = latent_dim
+        self.fdm_type = fdm_type
         self.object_encoder = SpatialVisualEncoder(4, state_dim)
         self.background_encoder = SpatialVisualEncoder(4, state_dim)
         self.idm = PerObjectIDM(state_dim, latent_dim)
-        self.fdm = IndependentObjectFDM(state_dim, latent_dim)
+        if fdm_type == "independent":
+            self.fdm = IndependentObjectFDM(state_dim, latent_dim)
+        elif fdm_type == "interaction":
+            self.fdm = InteractionObjectFDM(state_dim, latent_dim)
+        elif fdm_type == "spatial_interaction":
+            self.fdm = InteractionObjectFDM(state_dim, latent_dim, spatial_tokens=True)
+        else:
+            raise ValueError(f"unknown fdm_type: {fdm_type}")
         self.object_decoder = SlotDecoder(state_dim, 4)
         self.background_decoder = SlotDecoder(state_dim, 3)
 
@@ -120,6 +225,8 @@ class BoxingObjectLAM(nn.Module):
         self,
         batch: Dict[str, Tensor],
         ablation: Literal["normal", "zero", "shuffle"] = "normal",
+        opponent_ablation: Literal["normal", "mask_state", "shuffle_state", "mask_z", "shuffle_z"] = "normal",
+        target_slot: int | None = None,
     ) -> Dict[str, Tensor]:
         videos = batch["videos"]
         masks = batch["masks"]
@@ -140,15 +247,18 @@ class BoxingObjectLAM(nn.Module):
             z_used = self._shuffle_per_object(z)
         else:
             z_used = z
-        predicted = self.fdm(flat_t, z_used.reshape(-1, self.latent_dim))
-        predicted = predicted.reshape_as(state_t)
+        grouped_t = state_t.reshape(-1, 2, self.state_dim, *state_t.shape[-2:])
+        grouped_z = z_used.reshape(-1, 2, self.latent_dim)
+        predicted = self.fdm(grouped_t, grouped_z, opponent_ablation, target_slot).reshape_as(state_t)
 
         # During normal training, force transition-specific z to outperform
         # zero and same-object shuffled latents. This uses no action labels.
         normal_error = (predicted - state_tp1.detach()).square().mean(dim=(-3, -2, -1))
         if self.training and ablation == "normal":
             shuffled_z = self._shuffle_per_object(z.detach())
-            shuffled_prediction = self.fdm(flat_t, shuffled_z.reshape(-1, self.latent_dim)).reshape_as(state_t)
+            shuffled_prediction = self.fdm(
+                grouped_t, shuffled_z.reshape(-1, 2, self.latent_dim)
+            ).reshape_as(state_t)
             shuffled_error = (shuffled_prediction - state_tp1.detach()).square().mean(dim=(-3, -2, -1))
             zero_error = (state_t - state_tp1.detach()).square().mean(dim=(-3, -2, -1))
             margin = 5e-4

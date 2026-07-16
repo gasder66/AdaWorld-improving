@@ -15,6 +15,29 @@ SPEC.loader.exec_module(boxing)
 
 
 class BoxingDataHelpersTest(unittest.TestCase):
+    @staticmethod
+    def _state(boxes, pixels, arms=(0, 0, 0, 0), scores=(0, 0)):
+        fighters = []
+        for index, (box, count) in enumerate(zip(boxes, pixels)):
+            mask = np.zeros((12, 12), dtype=np.uint8)
+            mask.flat[:count] = 1
+            fighters.append(
+                boxing.FighterObservation(
+                    name=boxing.FIGHTER_NAMES[index],
+                    mask=mask,
+                    bbox_xyxy=box,
+                    center_xy=boxing._center_from_bbox(box),
+                    ram_bbox_xywh=(box[0], box[1], box[2] - box[0], box[3] - box[1]),
+                )
+            )
+        return boxing.FrameState(
+            frame=np.zeros((12, 12, 3), dtype=np.uint8),
+            fighters=tuple(fighters),
+            ram=np.zeros(128, dtype=np.uint8),
+            arm_lengths=arms,
+            scores=scores,
+        )
+
     def test_sprite_mask_is_not_a_filled_bbox(self):
         frame = np.zeros((12, 12, 3), dtype=np.uint8)
         frame[:] = (10, 20, 30)
@@ -48,6 +71,28 @@ class BoxingDataHelpersTest(unittest.TestCase):
         self.assertEqual(boxing._classify_punch_transition([16, 0], [8, 0]), "punch_retract")
         self.assertEqual(boxing._classify_punch_transition([8, 0], [0, 8]), "punch_switch")
         self.assertEqual(boxing._classify_punch_transition([0, 0], [0, 0]), "movement_only")
+
+    def test_interaction_labels_cover_contact_hit_occlusion_and_recovery(self):
+        states = [
+            self._state(((0, 0, 4, 4), (6, 0, 10, 4)), (20, 20)),
+            self._state(((0, 0, 6, 4), (4, 0, 10, 4)), (12, 20), arms=(8, 0, 0, 0)),
+            self._state(((0, 0, 4, 4), (7, 0, 11, 4)), (20, 20), scores=(1, 0)),
+        ]
+        labels = boxing._interaction_labels(
+            states, near_distance=3.0, occlusion_drop_ratio=0.15, neutral_arm_value=0
+        )
+        self.assertEqual(labels["near_labels"].tolist(), [1, 0, 1])
+        self.assertEqual(labels["contact_labels"].tolist(), [0, 1, 0])
+        self.assertEqual(labels["occlusion_labels"][:, 0].tolist(), [0, 1, 0])
+        self.assertEqual(labels["hit_labels"].tolist(), [0, 1])
+        self.assertEqual(labels["hit_actor"].tolist(), [-1, 0])
+        self.assertEqual(labels["hit_receiver"].tolist(), [-1, 1])
+        self.assertEqual(labels["recovery_labels"].tolist(), [0, 1])
+        self.assertEqual(labels["punch_miss_labels"][0, 0], 1)
+        self.assertEqual(
+            boxing._present_interaction_events(labels),
+            {"near", "contact", "punch_miss", "hit", "occlusion", "recovery"},
+        )
 
 
 if __name__ == "__main__":
