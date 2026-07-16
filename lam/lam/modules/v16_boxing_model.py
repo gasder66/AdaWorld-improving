@@ -15,7 +15,9 @@ class SpatialVisualEncoder(nn.Module):
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, 32, 5, stride=2, padding=2), nn.GroupNorm(4, 32), nn.GELU(),
             nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.GroupNorm(8, 64), nn.GELU(),
-            nn.Conv2d(64, state_dim, 3, stride=2, padding=1), nn.GroupNorm(8, state_dim), nn.GELU(),
+            # Keep H/4 spatial states. Boxing sprites are only ~14 px wide;
+            # H/8 reduced them to roughly two cells and destroyed contours.
+            nn.Conv2d(64, state_dim, 3, stride=1, padding=1), nn.GroupNorm(8, state_dim), nn.GELU(),
         )
 
     def forward(self, x: Tensor) -> Tensor:
