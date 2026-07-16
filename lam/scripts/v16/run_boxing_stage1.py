@@ -24,6 +24,35 @@ def _model_batch(batch: Dict[str, torch.Tensor], device: torch.device, transitio
     return result
 
 
+def _identity_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+    videos = batch["videos"].to(device)
+    masks = batch["masks"].to(device)
+    background = batch["background_masks"].to(device)
+    batch_size, time = videos.shape[:2]
+    videos = videos.reshape(batch_size * time, *videos.shape[2:])
+    masks = masks.reshape(batch_size * time, *masks.shape[2:])
+    background = background.reshape(batch_size * time, *background.shape[2:])
+    return {
+        "videos": videos.unsqueeze(1).expand(-1, 2, -1, -1, -1),
+        "masks": masks.unsqueeze(1).expand(-1, 2, -1, -1, -1),
+        "background_masks": background.unsqueeze(1).expand(-1, 2, -1, -1),
+    }
+
+
+def _set_phase(model: BoxingObjectLAM, phase: str) -> None:
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    if phase == "visual":
+        modules = (model.object_encoder, model.background_encoder, model.object_decoder, model.background_decoder)
+    elif phase == "dynamics":
+        modules = (model.idm, model.fdm)
+    else:
+        raise ValueError(phase)
+    for module in modules:
+        for parameter in module.parameters():
+            parameter.requires_grad_(True)
+
+
 def evaluate(
     model: BoxingObjectLAM, loader: DataLoader, device: torch.device, transition_gap: int
 ) -> Dict[str, Dict[str, float]]:
@@ -47,6 +76,7 @@ def main() -> None:
     parser.add_argument("--data_root", default="data/v16_boxing/stage1_movement")
     parser.add_argument("--output", default="result/v16/boxing_stage1_smoke")
     parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--pretrain_steps", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_train_samples", type=int, default=32)
     parser.add_argument("--max_val_samples", type=int, default=16)
@@ -64,10 +94,35 @@ def main() -> None:
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     model = BoxingObjectLAM(args.state_dim, args.latent_dim).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    history = {"visual": [], "dynamics": []}
+
+    _set_phase(model, "visual")
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=1e-4)
     iterator = iter(train_loader)
-    history = []
     model.train()
+    for step in range(args.pretrain_steps):
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            iterator = iter(train_loader)
+            batch = next(iterator)
+        out = model(_identity_batch(batch, device), ablation="zero")
+        visual_loss = (
+            out["object_rgb_loss"] + 0.5 * out["mask_bce"] + 0.5 * out["mask_dice_loss"]
+            + 0.25 * out["background_loss"] + 0.25 * out["reconstruction_loss"]
+        )
+        optimizer.zero_grad(set_to_none=True)
+        visual_loss.backward()
+        torch.nn.utils.clip_grad_norm_((p for p in model.parameters() if p.requires_grad), 1.0)
+        optimizer.step()
+        row = {"loss": float(visual_loss.detach()), "reconstruction_loss": float(out["reconstruction_loss"])}
+        history["visual"].append(row)
+        if step % 20 == 0 or step + 1 == args.pretrain_steps:
+            print(f"visual step={step:04d} " + " ".join(f"{k}={v:.5f}" for k, v in row.items()))
+
+    _set_phase(model, "dynamics")
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=1e-4)
+    iterator = iter(train_loader)
     for step in range(args.steps):
         try:
             batch = next(iterator)
@@ -84,10 +139,10 @@ def main() -> None:
             key: float(out[key].detach())
             for key in (
                 "loss", "state_loss", "reconstruction_loss", "object_rgb_loss",
-                "z_variance", "variance_floor_loss", "action_contrast_loss",
+                "z_variance", "variance_floor_loss", "z_norm_loss", "action_contrast_loss",
             )
         }
-        history.append(row)
+        history["dynamics"].append(row)
         if step % 20 == 0 or step + 1 == args.steps:
             print(f"step={step:04d} " + " ".join(f"{k}={v:.5f}" for k, v in row.items()))
     metrics = evaluate(model, val_loader, device, args.transition_gap)
