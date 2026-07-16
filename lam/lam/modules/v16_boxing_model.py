@@ -48,18 +48,18 @@ class IndependentObjectFDM(nn.Module):
     def __init__(self, state_dim: int, latent_dim: int) -> None:
         super().__init__()
         self.state_norm = nn.GroupNorm(8, state_dim)
-        self.z_up = nn.Linear(latent_dim, state_dim * 2)
+        self.z_up = nn.Linear(latent_dim, state_dim * 2, bias=False)
         self.transition = nn.Sequential(
-            nn.Conv2d(state_dim * 2, state_dim, 3, padding=1), nn.GELU(),
-            nn.Conv2d(state_dim, state_dim, 3, padding=1),
+            nn.Conv2d(state_dim, state_dim, 3, padding=1, bias=False), nn.GELU(),
+            nn.Conv2d(state_dim, state_dim, 3, padding=1, bias=False),
         )
 
     def forward(self, state_t: Tensor, z: Tensor) -> Tensor:
         gamma, beta = self.z_up(z).chunk(2, dim=-1)
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
         beta = beta.unsqueeze(-1).unsqueeze(-1)
-        modulated = self.state_norm(state_t) * (1.0 + gamma) + beta
-        return state_t + self.transition(torch.cat([state_t, modulated], dim=1))
+        modulated = self.state_norm(state_t) * gamma + beta
+        return state_t + self.transition(modulated)
 
 
 class SlotDecoder(nn.Module):
@@ -187,7 +187,7 @@ class BoxingObjectLAM(nn.Module):
         variance_floor_loss = F.relu(0.1 - z_std).mean()
         identity_state_loss = F.mse_loss(state_t, state_tp1.detach())
         total = (
-            state_loss
+            5.0 * state_loss
             + object_rgb_loss
             + 0.5 * mask_bce
             + 0.5 * dice
