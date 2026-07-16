@@ -25,21 +25,21 @@ def collect(model: BoxingObjectLAM, dataset, device: torch.device) -> Tuple[np.n
     features, arm_changes, displacements, slots = [], [], [], []
     model.eval()
     for batch in loader:
-        endpoints = torch.tensor([0, batch["videos"].shape[1] - 1])
         model_batch = {
-            key: batch[key].index_select(1, endpoints).to(device)
+            key: batch[key].to(device)
             for key in ("videos", "masks", "background_masks")
         }
         output = model(model_batch)
-        z = output["z_mu"][:, 0].cpu().numpy()
-        arm_change = (batch["arm_lengths"][:, -1] - batch["arm_lengths"][:, 0]).numpy()
-        displacement = batch["delta_xy"].sum(dim=1).numpy()
+        z = output["z_mu"].cpu().numpy()
+        arm_change = (batch["arm_lengths"][:, 1:] - batch["arm_lengths"][:, :-1]).numpy()
+        displacement = batch["delta_xy"].numpy()
         for b in range(z.shape[0]):
-            for slot in range(2):
-                features.append(z[b, slot])
-                arm_changes.append(arm_change[b, slot])
-                displacements.append(displacement[b, slot])
-                slots.append(slot)
+            for t in range(z.shape[1]):
+                for slot in range(2):
+                    features.append(z[b, t, slot])
+                    arm_changes.append(arm_change[b, t, slot])
+                    displacements.append(displacement[b, t, slot])
+                    slots.append(slot)
     return np.asarray(features), np.asarray(arm_changes), np.asarray(displacements), np.asarray(slots)
 
 
