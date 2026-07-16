@@ -93,10 +93,10 @@ def _render_sample(sample: Dict[str, Any], output_path: str, scale: int = 2) -> 
         draw.text((3, 30), f"t={t}", fill=(255, 255, 0))
         rows[0].append(image)
         for k in range(2):
-            isolated = np.zeros_like(frame)
+            isolated = np.full_like(frame, 96)
             isolated[masks[t, k]] = frame[masks[t, k]]
             rows[k + 1].append(Image.fromarray(isolated))
-        bg = np.zeros_like(frame)
+        bg = np.full_like(frame, (255, 0, 255))
         bg[background[t]] = frame[background[t]]
         rows[3].append(Image.fromarray(bg))
 
