@@ -140,6 +140,22 @@ class BoxingObjectLAM(nn.Module):
         predicted = self.fdm(flat_t, z_used.reshape(-1, self.latent_dim))
         predicted = predicted.reshape_as(state_t)
 
+        # During normal training, force transition-specific z to outperform
+        # zero and same-object shuffled latents. This uses no action labels.
+        normal_error = (predicted - state_tp1.detach()).square().mean(dim=(-3, -2, -1))
+        if self.training and ablation == "normal":
+            shuffled_z = self._shuffle_per_object(z.detach())
+            shuffled_prediction = self.fdm(flat_t, shuffled_z.reshape(-1, self.latent_dim)).reshape_as(state_t)
+            shuffled_error = (shuffled_prediction - state_tp1.detach()).square().mean(dim=(-3, -2, -1))
+            zero_error = (state_t - state_tp1.detach()).square().mean(dim=(-3, -2, -1))
+            margin = 5e-4
+            action_contrast_loss = (
+                F.relu(normal_error + margin - shuffled_error).mean()
+                + F.relu(normal_error + margin - zero_error).mean()
+            )
+        else:
+            action_contrast_loss = torch.zeros((), device=videos.device)
+
         object_logits = self.object_decoder(
             predicted.reshape(-1, self.state_dim, *predicted.shape[-2:]), (height, width)
         ).reshape(batch_size, time - 1, 2, 4, height, width)
@@ -194,6 +210,7 @@ class BoxingObjectLAM(nn.Module):
             + 0.25 * background_loss
             + 0.25 * reconstruction_loss
             + 0.1 * variance_floor_loss
+            + 5.0 * action_contrast_loss
         )
         return {
             "loss": total,
@@ -205,6 +222,7 @@ class BoxingObjectLAM(nn.Module):
             "reconstruction_loss": reconstruction_loss,
             "kl_loss": kl,
             "variance_floor_loss": variance_floor_loss,
+            "action_contrast_loss": action_contrast_loss,
             "z_variance": z_variance,
             "identity_state_loss": identity_state_loss,
             "z": z,
