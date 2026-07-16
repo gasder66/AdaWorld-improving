@@ -55,7 +55,8 @@ def _set_phase(model: BoxingObjectLAM, phase: str) -> None:
 
 
 def evaluate(
-    model: BoxingObjectLAM, loader: DataLoader, device: torch.device, transition_gap: int
+    model: BoxingObjectLAM, loader: DataLoader, device: torch.device, transition_gap: int,
+    max_batches: int = 0,
 ) -> Dict[str, Dict[str, float]]:
     model.eval()
     result: Dict[str, Dict[str, float]] = {}
@@ -68,6 +69,8 @@ def evaluate(
             for key in ("loss", "state_loss", "identity_state_loss", "reconstruction_loss", "object_rgb_loss", "z_variance"):
                 sums[key] = sums.get(key, 0.0) + float(out[key])
             count += 1
+            if max_batches and count >= max_batches:
+                break
         result[ablation] = {key: value / max(1, count) for key, value in sums.items()}
     return result
 
@@ -79,6 +82,7 @@ def main() -> None:
     parser.add_argument("--init_checkpoint", default=None)
     parser.add_argument("--transition_index_dir", default=None)
     parser.add_argument("--balanced_samples", type=int, default=0)
+    parser.add_argument("--max_eval_batches", type=int, default=0)
     parser.add_argument("--output", default="result/v16/boxing_stage1_smoke")
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--pretrain_steps", type=int, default=200)
@@ -168,7 +172,7 @@ def main() -> None:
         history["dynamics"].append(row)
         if step % 20 == 0 or step + 1 == args.steps:
             print(f"step={step:04d} " + " ".join(f"{k}={v:.5f}" for k, v in row.items()))
-    metrics = evaluate(model, val_loader, device, args.transition_gap)
+    metrics = evaluate(model, val_loader, device, args.transition_gap, args.max_eval_batches)
     os.makedirs(args.output, exist_ok=True)
     torch.save({"model": model.state_dict(), "args": vars(args)}, os.path.join(args.output, "model.pt"))
     with open(os.path.join(args.output, "metrics.json"), "w", encoding="utf-8") as f:
