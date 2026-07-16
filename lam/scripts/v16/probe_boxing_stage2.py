@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import balanced_accuracy_score
+from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import ConcatDataset, DataLoader
 
@@ -20,9 +21,9 @@ from lam.modules.v16_boxing_model import BoxingObjectLAM
 
 
 @torch.no_grad()
-def collect(model: BoxingObjectLAM, dataset, device: torch.device) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def collect(model: BoxingObjectLAM, dataset, device: torch.device):
     loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)
-    features, arm_changes, displacements, slots = [], [], [], []
+    features, arm_changes, next_arms, displacements, slots = [], [], [], [], []
     model.eval()
     for batch in loader:
         model_batch = {
@@ -32,15 +33,20 @@ def collect(model: BoxingObjectLAM, dataset, device: torch.device) -> Tuple[np.n
         output = model(model_batch)
         z = output["z_mu"].cpu().numpy()
         arm_change = (batch["arm_lengths"][:, 1:] - batch["arm_lengths"][:, :-1]).numpy()
+        next_arm = batch["arm_lengths"][:, 1:].numpy()
         displacement = batch["delta_xy"].numpy()
         for b in range(z.shape[0]):
             for t in range(z.shape[1]):
                 for slot in range(2):
                     features.append(z[b, t, slot])
                     arm_changes.append(arm_change[b, t, slot])
+                    next_arms.append(next_arm[b, t, slot])
                     displacements.append(displacement[b, t, slot])
                     slots.append(slot)
-    return np.asarray(features), np.asarray(arm_changes), np.asarray(displacements), np.asarray(slots)
+    return (
+        np.asarray(features), np.asarray(arm_changes), np.asarray(next_arms),
+        np.asarray(displacements), np.asarray(slots),
+    )
 
 
 def r2_per_dim(target: np.ndarray, prediction: np.ndarray) -> np.ndarray:
@@ -70,8 +76,8 @@ def main() -> None:
         BoxingObjectDataset(os.path.join(args.movement_root, "val"), target_frames=5),
         BoxingObjectDataset(os.path.join(args.punch_root, "val"), target_frames=5),
     ])
-    train_x, train_arm, train_displacement, _ = collect(model, train, device)
-    val_x, val_arm, val_displacement, val_slots = collect(model, val, device)
+    train_x, train_arm, train_next_arm, train_displacement, _ = collect(model, train, device)
+    val_x, val_arm, val_next_arm, val_displacement, val_slots = collect(model, val, device)
     scaler = StandardScaler().fit(train_x)
     train_scaled = scaler.transform(train_x)
     val_scaled = scaler.transform(val_x)
@@ -79,6 +85,15 @@ def main() -> None:
     val_punch = (np.abs(val_arm).max(axis=1) > 0).astype(np.int64)
     classifier = LogisticRegression(max_iter=2000, class_weight="balanced").fit(train_scaled, train_punch)
     punch_prediction = classifier.predict(val_scaled)
+    train_active = (np.abs(train_next_arm).max(axis=1) > 0).astype(np.int64)
+    val_active = (np.abs(val_next_arm).max(axis=1) > 0).astype(np.int64)
+    active_linear = LogisticRegression(max_iter=2000, class_weight="balanced").fit(train_scaled, train_active)
+    active_linear_prediction = active_linear.predict(val_scaled)
+    active_mlp = MLPClassifier(
+        hidden_layer_sizes=(32,), activation="relu", max_iter=500,
+        early_stopping=True, random_state=0,
+    ).fit(train_scaled, train_active)
+    active_mlp_prediction = active_mlp.predict(val_scaled)
     arm_probe = Ridge(alpha=1.0).fit(train_scaled, train_arm)
     arm_prediction = arm_probe.predict(val_scaled)
     motion_probe = Ridge(alpha=1.0).fit(train_scaled, train_displacement)
@@ -89,6 +104,8 @@ def main() -> None:
         "val_latents": int(len(val_x)),
         "val_punch_fraction": float(val_punch.mean()),
         "punch_balanced_accuracy": float(balanced_accuracy_score(val_punch, punch_prediction)),
+        "punch_active_linear_balanced_accuracy": float(balanced_accuracy_score(val_active, active_linear_prediction)),
+        "punch_active_mlp_balanced_accuracy": float(balanced_accuracy_score(val_active, active_mlp_prediction)),
         "arm_delta_r2_left": float(r2_per_dim(val_arm, arm_prediction)[0]),
         "arm_delta_r2_right": float(r2_per_dim(val_arm, arm_prediction)[1]),
         "motion_r2_dx": float(r2_per_dim(val_displacement, motion_prediction)[0]),
