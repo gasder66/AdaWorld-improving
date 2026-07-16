@@ -27,6 +27,7 @@ FIGHTER_COLORS = ((214, 214, 214), (0, 0, 0))
 # arms in the opposite source order (right=59, left=61).
 ARM_RAM_INDICES = (55, 57, 61, 59)
 SCORE_RAM_INDICES = (18, 19)
+PUNCH_EVENT_NAMES = ("punch_onset", "punch_extend", "punch_hold", "punch_retract", "punch_switch")
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,37 @@ def _movement_label(dx: float, dy: float, deadzone: float = 0.5) -> int:
     return 2 if dy > 0 else 1
 
 
+def _arm_side(arms: Sequence[int]) -> str:
+    left = int(arms[0]) != 0
+    right = int(arms[1]) != 0
+    if left and right:
+        return "both"
+    if left:
+        return "left"
+    if right:
+        return "right"
+    return "none"
+
+
+def _classify_punch_transition(previous: Sequence[int], current: Sequence[int]) -> str:
+    previous = np.asarray(previous, dtype=np.int16)
+    current = np.asarray(current, dtype=np.int16)
+    previous_active = bool(np.any(previous != 0))
+    current_active = bool(np.any(current != 0))
+    if not previous_active and current_active:
+        return "punch_onset"
+    if previous_active and current_active and _arm_side(previous) != _arm_side(current):
+        return "punch_switch"
+    delta = current - previous
+    if current_active and bool(np.any(delta > 0)):
+        return "punch_extend"
+    if previous_active and bool(np.any(delta < 0)):
+        return "punch_retract"
+    if current_active:
+        return "punch_hold"
+    return "movement_only"
+
+
 def _clip_is_stage1(
     states: Sequence[FrameState],
     *,
@@ -223,6 +255,8 @@ def _clip_is_isolated_punch(
     *,
     min_separation: float,
     neutral_arm_value: int,
+    required_punch_actor: str = "any",
+    required_punch_events: Sequence[str] = (),
 ) -> Tuple[bool, str]:
     arm_values = np.asarray([state.arm_lengths for state in states], dtype=np.int16)
     punch_active = arm_values != neutral_arm_value
@@ -230,6 +264,18 @@ def _clip_is_isolated_punch(
         return False, "no_punch"
     if not np.any(arm_values[1:] != arm_values[:-1]):
         return False, "no_punch_phase_change"
+    actor_slots = {"any": (0, 1), "player": (0,), "enemy": (1,)}[required_punch_actor]
+    actor_events = {
+        _classify_punch_transition(arm_values[t, slot], arm_values[t + 1, slot])
+        for slot in actor_slots
+        for t in range(len(states) - 1)
+    }
+    requested = set(required_punch_events)
+    if requested:
+        if actor_events.isdisjoint(requested):
+            return False, "missing_required_punch_event"
+    elif not actor_events.intersection(PUNCH_EVENT_NAMES):
+        return False, "missing_required_punch_actor"
     if any(state.scores != states[0].scores for state in states[1:]):
         return False, "score_change"
     for state in states:
@@ -253,6 +299,8 @@ def _make_sample(
     frame_start: int,
     action_meanings: Sequence[str],
     stage: str,
+    required_punch_actor: str,
+    required_punch_events: Sequence[str],
 ) -> Dict[str, Any]:
     frames = np.stack([state.frame for state in states])
     masks = np.stack([[fighter.mask for fighter in state.fighters] for state in states])
@@ -384,6 +432,8 @@ def _generate_split(
                         candidate,
                         min_separation=min_separation,
                         neutral_arm_value=neutral_arm_value,
+                        required_punch_actor=required_punch_actor,
+                        required_punch_events=required_punch_events,
                     )
                 if ok:
                     sample = _make_sample(
@@ -458,6 +508,19 @@ def main() -> None:
     parser.add_argument("--neutral_arm_value", type=int, default=0)
     parser.add_argument("--frameskip", type=int, default=1)
     parser.add_argument(
+        "--required_punch_actor",
+        choices=["any", "player", "enemy"],
+        default="any",
+        help="For isolated-punch data, retain only clips containing a punch transition for this actor.",
+    )
+    parser.add_argument(
+        "--required_punch_events",
+        nargs="*",
+        choices=PUNCH_EVENT_NAMES,
+        default=[],
+        help="Optional isolated-punch phase filter. Labels are used only for data selection/evaluation.",
+    )
+    parser.add_argument(
         "--stage",
         choices=["movement_no_punch_no_contact_no_occlusion", "isolated_punch_no_contact_no_occlusion"],
         default="movement_no_punch_no_contact_no_occlusion",
@@ -482,6 +545,8 @@ def main() -> None:
                 neutral_arm_value=args.neutral_arm_value,
                 frameskip=args.frameskip,
                 stage=args.stage,
+                required_punch_actor=args.required_punch_actor,
+                required_punch_events=args.required_punch_events,
             )
         )
     config = {**vars(args), "env_name": ENV_NAME, "reports": reports}

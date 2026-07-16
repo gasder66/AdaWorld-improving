@@ -41,6 +41,14 @@ class BoxingDataHelpersTest(unittest.TestCase):
         self.assertEqual(boxing._movement_label(-3.0, 1.0), 3)
         self.assertEqual(boxing._movement_label(3.0, 1.0), 4)
 
+    def test_punch_transition_phase_classification(self):
+        self.assertEqual(boxing._classify_punch_transition([0, 0], [8, 0]), "punch_onset")
+        self.assertEqual(boxing._classify_punch_transition([8, 0], [16, 0]), "punch_extend")
+        self.assertEqual(boxing._classify_punch_transition([16, 0], [16, 0]), "punch_hold")
+        self.assertEqual(boxing._classify_punch_transition([16, 0], [8, 0]), "punch_retract")
+        self.assertEqual(boxing._classify_punch_transition([8, 0], [0, 8]), "punch_switch")
+        self.assertEqual(boxing._classify_punch_transition([0, 0], [0, 0]), "movement_only")
+
 
 if __name__ == "__main__":
     unittest.main()
