@@ -115,7 +115,7 @@ def _set_phase(model: BoxingObjectLAM, phase: str) -> None:
 
 def evaluate(
     model: BoxingObjectLAM, loader: DataLoader, device: torch.device, transition_gap: int,
-    max_batches: int = 0,
+    max_batches: int = 0, rollout_weight: float = 0.0,
 ) -> Dict[str, Dict[str, float]]:
     model.eval()
     result: Dict[str, Dict[str, float]] = {}
@@ -126,10 +126,14 @@ def evaluate(
             model_batch = _model_batch(
                 batch, device, transition_gap, model.temporal_context
             )
-            out = model(model_batch, ablation=ablation)
+            out = model(
+                model_batch, ablation=ablation, rollout_weight=rollout_weight
+            )
             for key in (
                 "loss", "state_loss", "identity_state_loss", "reconstruction_loss",
                 "object_rgb_loss", "mask_dice_loss", "mask_iou", "z_variance",
+                "rollout_loss", "rollout_state_loss", "rollout_mask_bce",
+                "rollout_mask_dice",
             ):
                 sums[key] = sums.get(key, 0.0) + float(out[key])
             count += 1
@@ -177,6 +181,8 @@ def main() -> None:
     parser.add_argument("--idm_layers", type=int, default=2)
     parser.add_argument("--idm_heads", type=int, default=4)
     parser.add_argument("--temporal_context", type=int, choices=[1, 3, 5], default=1)
+    parser.add_argument("--prediction_horizon", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--rollout_weight", type=float, default=0.0)
     parser.add_argument("--temporal_token_grid", type=int, default=8)
     parser.add_argument("--temporal_layers", type=int, default=2)
     parser.add_argument("--temporal_heads", type=int, default=4)
@@ -202,10 +208,12 @@ def main() -> None:
         train_ds = BoxingTransitionDataset(
             os.path.join(args.transition_index_dir, "train.pt"),
             temporal_context=args.temporal_context,
+            prediction_horizon=args.prediction_horizon,
         )
         val_ds = BoxingTransitionDataset(
             os.path.join(args.transition_index_dir, "val.pt"),
             temporal_context=args.temporal_context,
+            prediction_horizon=args.prediction_horizon,
         )
         train_sampler = train_ds.balanced_sampler(args.balanced_samples or None, args.seed, args.balance_mode)
     else:
@@ -337,7 +345,7 @@ def main() -> None:
             _model_batch(batch, device, args.transition_gap, args.temporal_context),
             args.content_recolor_probability,
         )
-        out = model(model_batch)
+        out = model(model_batch, rollout_weight=args.rollout_weight)
         optimizer.zero_grad(set_to_none=True)
         out["loss"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -349,12 +357,21 @@ def main() -> None:
                 "mask_dice_loss", "mask_iou",
                 "dynamic_mask_loss", "edge_loss",
                 "z_variance", "variance_floor_loss", "z_norm_loss", "action_contrast_loss",
+                "rollout_loss", "rollout_state_loss", "rollout_mask_bce",
+                "rollout_mask_dice",
             )
         }
         history["dynamics"].append(row)
         if step % 20 == 0 or step + 1 == args.steps:
             print(f"step={step:04d} " + " ".join(f"{k}={v:.5f}" for k, v in row.items()))
-    metrics = evaluate(model, val_loader, device, args.transition_gap, args.max_eval_batches)
+    metrics = evaluate(
+        model,
+        val_loader,
+        device,
+        args.transition_gap,
+        args.max_eval_batches,
+        args.rollout_weight,
+    )
     os.makedirs(args.output, exist_ok=True)
     torch.save({"model": model.state_dict(), "args": vars(args)}, os.path.join(args.output, "model.pt"))
     with open(os.path.join(args.output, "metrics.json"), "w", encoding="utf-8") as f:

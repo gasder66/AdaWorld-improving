@@ -51,15 +51,31 @@ DEFAULT_INTERACTION_PROBABILITIES = {
 
 
 class BoxingTransitionDataset(Dataset):
-    def __init__(self, index_path: str, temporal_context: int = 1) -> None:
+    def __init__(
+        self,
+        index_path: str,
+        temporal_context: int = 1,
+        prediction_horizon: int = 1,
+    ) -> None:
         index = torch.load(index_path, map_location="cpu", weights_only=False)
         if temporal_context < 1:
             raise ValueError("temporal_context must be positive")
+        if prediction_horizon < 1:
+            raise ValueError("prediction_horizon must be positive")
         self.temporal_context = temporal_context
+        self.prediction_horizon = prediction_horizon
+        available_transitions = {
+            (entry["path"], int(entry["transition"])) for entry in index["entries"]
+        }
         self.entries: List[Dict[str, Any]] = [
             entry
             for entry in index["entries"]
             if int(entry["transition"]) >= temporal_context - 1
+            and all(
+                (entry["path"], int(entry["transition"]) + offset)
+                in available_transitions
+                for offset in range(prediction_horizon)
+            )
         ]
         resolved_index = Path(index_path).resolve()
         self.project_root = next(
@@ -91,7 +107,10 @@ class BoxingTransitionDataset(Dataset):
             raise RuntimeError(f"failed to load Boxing sample: {sample_path}")
         raw = self._cached_sample
         t = int(entry["transition"])
-        frame_indices = torch.arange(t - self.temporal_context + 1, t + 2)
+        frame_indices = torch.arange(
+            t - self.temporal_context + 1,
+            t + self.prediction_horizon + 1,
+        )
         videos = raw["videos"].index_select(0, frame_indices).float() / 255.0
         masks = raw["masks"].index_select(0, frame_indices).float()
         background = raw["background_masks"].index_select(0, frame_indices).float()

@@ -231,6 +231,41 @@ class BoxingObjectLAMTest(unittest.TestCase):
             )
         )
 
+    def test_two_step_recursive_rollout_uses_predicted_first_state(self):
+        torch.manual_seed(7)
+        model = BoxingObjectLAM(
+            state_dim=32,
+            latent_dim=8,
+            object_input_mode="mask_only",
+            structure_scale=2,
+            temporal_context=3,
+            temporal_token_grid=4,
+            temporal_layers=1,
+            temporal_heads=4,
+        ).eval()
+        base = self._batch()
+        batch = {
+            key: torch.cat([value, value[:, -1:], value[:, -1:]], dim=1)
+            for key, value in base.items()
+        }
+        batch["masks"][:, -1, 0] = batch["masks"][:, -1, 0].roll(2, dims=-1)
+        batch["background_masks"] = 1 - batch["masks"].sum(dim=2).clamp(0, 1)
+        with torch.no_grad():
+            output = model(batch, rollout_weight=1.0)
+        self.assertEqual(output["z"].shape, (2, 2, 2, 8))
+        self.assertEqual(
+            output["rollout_predicted_object_states"].shape,
+            output["predicted_object_states"].shape,
+        )
+        self.assertTrue(
+            torch.allclose(
+                output["rollout_predicted_object_states"][:, 0],
+                output["predicted_object_states"][:, 0],
+            )
+        )
+        self.assertTrue(torch.isfinite(output["rollout_loss"]))
+        self.assertGreater(float(output["rollout_loss"]), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

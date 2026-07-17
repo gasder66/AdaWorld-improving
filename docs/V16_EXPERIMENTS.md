@@ -147,3 +147,22 @@ This file records milestone experiments for the V16 object-wise Boxing LAM. Indi
   with a phase-sensitive multi-step or temporal-order objective rather than
   merely increasing Transformer depth. Full results are in
   `docs/V16_E08B_FULL_REPORT.md`.
+
+### E09 — phase-sensitive two-step temporal rollout
+
+- Purpose: test whether E08B's causal three-frame object features preserve
+  punch phase when the forward model must carry its own prediction into the
+  next transition, instead of solving every adjacent pair independently.
+- Data window: five consecutive frames. Frames 1--3 form the first causal
+  context, frame 4 is the first target, and frame 5 is the second target.
+- IDM remains object-wise and unchanged. It infers one continuous latent from
+  each adjacent pair of contextual object states.
+- FDM transition 1 is teacher-forced from the encoded current state. Transition
+  2 recursively receives transition 1's predicted state and its own latent.
+- The added rollout objective supervises the second predicted feature state and
+  fighter masks. It does not use punch labels and does not add a new action
+  encoder.
+- Controlled initialization: each E09 seed starts from the matching completed
+  E08B seed. The first decision gate is whether recursive mask/feature error
+  improves without reducing normal-vs-zero/shuffle latent necessity.
+- Launcher: `lam/scripts/v16/run_e09_temporal_rollout.sh`.

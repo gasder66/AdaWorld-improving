@@ -571,6 +571,20 @@ class BoxingObjectLAM(nn.Module):
             )
         return torch.stack(contextual, dim=1)
 
+    def _condition_decoder_states(
+        self, states: Tensor, content_states: Tensor | None
+    ) -> Tensor:
+        if content_states is None:
+            return states
+        flat_states = states.reshape(-1, self.state_dim, *states.shape[-2:])
+        flat_content = content_states.reshape(-1, self.state_dim)
+        gamma, beta = self.content_conditioner(flat_content).chunk(2, dim=-1)
+        gamma = 0.1 * torch.tanh(gamma).unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        return (
+            self.content_state_norm(flat_states) * (1.0 + gamma) + beta
+        ).reshape_as(states)
+
     def forward(
         self,
         batch: Dict[str, Tensor],
@@ -578,6 +592,7 @@ class BoxingObjectLAM(nn.Module):
         opponent_ablation: Literal["normal", "mask_state", "shuffle_state", "mask_z", "shuffle_z"] = "normal",
         target_slot: int | None = None,
         content_ablation: Literal["normal", "zero", "shuffle", "swap_slots"] = "normal",
+        rollout_weight: float = 0.0,
     ) -> Dict[str, Tensor]:
         videos = batch["videos"]
         masks = batch["masks"]
@@ -624,7 +639,6 @@ class BoxingObjectLAM(nn.Module):
         else:
             action_contrast_loss = torch.zeros((), device=videos.device)
 
-        decoder_states = predicted
         content_used = None
         if content_states is not None:
             content_used = content_states[:, target_start - 1 : -1]
@@ -636,14 +650,7 @@ class BoxingObjectLAM(nn.Module):
                 content_used = content_used.flip(dims=(2,))
             elif content_ablation != "normal":
                 raise ValueError(f"unknown content_ablation: {content_ablation}")
-            flat_predicted = predicted.reshape(-1, self.state_dim, *predicted.shape[-2:])
-            flat_content = content_used.reshape(-1, self.state_dim)
-            gamma, beta = self.content_conditioner(flat_content).chunk(2, dim=-1)
-            gamma = 0.1 * torch.tanh(gamma).unsqueeze(-1).unsqueeze(-1)
-            beta = beta.unsqueeze(-1).unsqueeze(-1)
-            decoder_states = (
-                self.content_state_norm(flat_predicted) * (1.0 + gamma) + beta
-            ).reshape_as(predicted)
+        decoder_states = self._condition_decoder_states(predicted, content_used)
         object_logits = self.object_decoder(
             decoder_states.reshape(-1, self.state_dim, *decoder_states.shape[-2:]), (height, width)
         ).reshape(batch_size, time - target_start, 2, 4, height, width)
@@ -715,6 +722,60 @@ class BoxingObjectLAM(nn.Module):
         variance_floor_loss = F.relu(0.1 - z_std).mean()
         z_norm_loss = mu.square().mean()
         identity_state_loss = F.mse_loss(state_t, state_tp1.detach())
+
+        # E09: after the first teacher-forced transition, recursively feed the
+        # predicted object states into the same FDM. The IDM still infers one
+        # object-specific z per adjacent visual transition; only the forward
+        # model is tested for phase-preserving short-horizon dynamics.
+        rollout_predicted = predicted
+        rollout_state_loss = torch.zeros((), device=videos.device)
+        rollout_mask_bce = torch.zeros((), device=videos.device)
+        rollout_mask_dice = torch.zeros((), device=videos.device)
+        if rollout_weight > 0.0 and predicted.shape[1] > 1:
+            rollout_steps = [predicted[:, 0]]
+            for step in range(1, predicted.shape[1]):
+                rollout_steps.append(
+                    self.fdm(
+                        rollout_steps[-1],
+                        z_used[:, step],
+                        opponent_ablation,
+                        target_slot,
+                    )
+                )
+            rollout_predicted = torch.stack(rollout_steps, dim=1)
+            rollout_state_loss = F.mse_loss(
+                rollout_predicted[:, 1:], state_tp1[:, 1:].detach()
+            )
+            rollout_decoder_states = self._condition_decoder_states(
+                rollout_predicted, content_used
+            )
+            rollout_logits = self.object_decoder(
+                rollout_decoder_states.reshape(
+                    -1, self.state_dim, *rollout_decoder_states.shape[-2:]
+                ),
+                (height, width),
+            ).reshape(batch_size, time - target_start, 2, 4, height, width)
+            rollout_mask_logits = rollout_logits[:, 1:, :, 3]
+            rollout_targets = target_masks[:, 1:]
+            rollout_mask_bce = F.binary_cross_entropy_with_logits(
+                rollout_mask_logits, rollout_targets, pos_weight=pos_weight
+            )
+            rollout_probs = torch.sigmoid(rollout_mask_logits)
+            rollout_mask_dice = 1.0 - (
+                (
+                    2.0
+                    * (rollout_probs * rollout_targets).sum(dim=(-2, -1))
+                    + 1.0
+                )
+                / (
+                    rollout_probs.sum(dim=(-2, -1))
+                    + rollout_targets.sum(dim=(-2, -1))
+                    + 1.0
+                )
+            ).mean()
+        rollout_loss = (
+            5.0 * rollout_state_loss + rollout_mask_bce + rollout_mask_dice
+        )
         structure_first = self.object_input_mode in {"mask_only", "mask_structure_content"}
         object_rgb_weight = 0.25 if self.object_input_mode == "mask_only" else 1.0
         mask_weight = 1.0 if structure_first else 0.5
@@ -730,6 +791,7 @@ class BoxingObjectLAM(nn.Module):
             + 0.1 * variance_floor_loss
             + 10.0 * action_contrast_loss
             + 1e-3 * z_norm_loss
+            + rollout_weight * rollout_loss
         )
         return {
             "loss": total,
@@ -748,12 +810,17 @@ class BoxingObjectLAM(nn.Module):
             "action_contrast_loss": action_contrast_loss,
             "z_variance": z_variance,
             "identity_state_loss": identity_state_loss,
+            "rollout_loss": rollout_loss,
+            "rollout_state_loss": rollout_state_loss,
+            "rollout_mask_bce": rollout_mask_bce,
+            "rollout_mask_dice": rollout_mask_dice,
             "z": z,
             "z_mu": mu,
             "z_logvar": logvar,
             "object_states": object_states,
             "contextual_object_states": contextual_states,
             "predicted_object_states": predicted,
+            "rollout_predicted_object_states": rollout_predicted,
             "background_states": background_states,
             "content_states": content_states,
             "content_used": content_used,
