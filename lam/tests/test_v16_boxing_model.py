@@ -42,7 +42,7 @@ class BoxingObjectLAMTest(unittest.TestCase):
 
     def test_object_input_modes(self):
         batch = self._batch()
-        for mode in ("masked_rgb_mask", "mask_only", "masked_rgb"):
+        for mode in ("masked_rgb_mask", "mask_only", "masked_rgb", "mask_structure_content"):
             model = BoxingObjectLAM(
                 state_dim=32, latent_dim=8, object_input_mode=mode
             ).eval()
@@ -61,6 +61,30 @@ class BoxingObjectLAMTest(unittest.TestCase):
             original = mask_model(batch)
             recolored = mask_model(changed)
         self.assertTrue(torch.allclose(original["z"], recolored["z"], atol=1e-6))
+
+    def test_structure_content_path_separates_dynamics_and_decoding(self):
+        torch.manual_seed(3)
+        model = BoxingObjectLAM(
+            state_dim=32, latent_dim=8, object_input_mode="mask_structure_content"
+        ).eval()
+        batch = self._batch()
+        recolored = {key: value.clone() for key, value in batch.items()}
+        recolored["videos"] = torch.rand_like(recolored["videos"])
+        with torch.no_grad():
+            normal = model(batch)
+            changed_rgb = model(recolored)
+            swapped_content = model(batch, content_ablation="swap_slots")
+        self.assertIsNotNone(normal["content_states"])
+        self.assertTrue(torch.allclose(normal["z"], changed_rgb["z"], atol=1e-6))
+        self.assertTrue(
+            torch.allclose(
+                normal["predicted_object_states"],
+                swapped_content["predicted_object_states"],
+                atol=1e-7,
+            )
+        )
+        self.assertFalse(torch.allclose(normal["reconstruction"], changed_rgb["reconstruction"]))
+        self.assertFalse(torch.allclose(normal["reconstruction"], swapped_content["reconstruction"]))
 
     def test_interaction_fdm_and_opponent_ablation(self):
         torch.manual_seed(1)

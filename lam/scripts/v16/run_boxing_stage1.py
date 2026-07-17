@@ -57,11 +57,35 @@ def _identity_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dic
     }
 
 
+def _recolor_objects(
+    batch: Dict[str, torch.Tensor], probability: float
+) -> Dict[str, torch.Tensor]:
+    if probability <= 0:
+        return batch
+    videos = batch["videos"].clone()
+    masks = batch["masks"]
+    batch_size = videos.shape[0]
+    apply = (torch.rand(batch_size, device=videos.device) < probability).float()
+    colors = 0.15 + 0.8 * torch.rand(
+        batch_size, 1, 2, 3, 1, 1, device=videos.device
+    )
+    for slot in range(2):
+        alpha = masks[:, :, slot].unsqueeze(2) * apply[:, None, None, None, None]
+        videos = videos * (1.0 - alpha) + colors[:, :, slot] * alpha
+    return {**batch, "videos": videos}
+
+
 def _set_phase(model: BoxingObjectLAM, phase: str) -> None:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     if phase == "visual":
-        modules = (model.object_encoder, model.background_encoder, model.object_decoder, model.background_decoder)
+        modules = [
+            model.background_encoder, model.object_decoder, model.background_decoder,
+        ]
+        if model.object_input_mode != "mask_structure_content":
+            modules.append(model.object_encoder)
+        if model.content_encoder is not None:
+            modules.extend([model.content_encoder, model.content_conditioner])
     elif phase == "dynamics":
         modules = (model.idm, model.fdm)
     else:
@@ -118,13 +142,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--object_input_mode",
-        choices=["masked_rgb_mask", "mask_only", "masked_rgb"],
+        choices=["masked_rgb_mask", "mask_only", "masked_rgb", "mask_structure_content"],
         default="masked_rgb_mask",
     )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--transition_gap", type=int, choices=[1, 4], default=4)
+    parser.add_argument("--content_recolor_probability", type=float, default=0.0)
     args = parser.parse_args()
     if args.transition_index_dir and args.batch_size < 2:
         raise ValueError("transition-balanced training requires batch_size >= 2 for genuine same-object shuffle")
@@ -194,7 +219,8 @@ def main() -> None:
         except StopIteration:
             iterator = iter(train_loader)
             batch = next(iterator)
-        out = model(_identity_batch(batch, device), ablation="zero")
+        visual_batch = _recolor_objects(_identity_batch(batch, device), args.content_recolor_probability)
+        out = model(visual_batch, ablation="zero")
         object_rgb_weight = 0.25 if args.object_input_mode == "mask_only" else 1.0
         visual_loss = (
             object_rgb_weight * out["object_rgb_loss"] + out["mask_bce"] + out["mask_dice_loss"]
@@ -223,7 +249,10 @@ def main() -> None:
         except StopIteration:
             iterator = iter(train_loader)
             batch = next(iterator)
-        model_batch = _model_batch(batch, device, args.transition_gap)
+        model_batch = _recolor_objects(
+            _model_batch(batch, device, args.transition_gap),
+            args.content_recolor_probability,
+        )
         out = model(model_batch)
         optimizer.zero_grad(set_to_none=True)
         out["loss"].backward()

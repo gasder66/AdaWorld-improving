@@ -1,4 +1,4 @@
-"""Complete reconstruction and latent-space diagnostics for V16 E04."""
+"""Complete reconstruction and latent-space diagnostics for V16 Boxing experiments."""
 from __future__ import annotations
 
 import argparse
@@ -208,7 +208,7 @@ def make_manifold(values: Dict[str, np.ndarray], output_dir: str, seed: int) -> 
     axes[1, 0].legend(loc="best", ncol=2, fontsize=7)
     axes[1, 1].legend(loc="best", fontsize=8)
     axes[1, 2].legend(loc="best", ncol=2, fontsize=8)
-    figure.suptitle("E04 residual interaction model — target-object latent space")
+    figure.suptitle("V16 Boxing ObjectLAM — target-object latent space")
     path = os.path.join(output_dir, "latent_semantic_space.png")
     figure.savefig(path, dpi=180)
     plt.close(figure)
