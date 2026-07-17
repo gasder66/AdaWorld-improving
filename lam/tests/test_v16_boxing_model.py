@@ -114,6 +114,25 @@ class BoxingObjectLAMTest(unittest.TestCase):
             )
         )
 
+    def test_high_resolution_structure_and_spatial_idm(self):
+        model = BoxingObjectLAM(
+            state_dim=32,
+            latent_dim=8,
+            object_input_mode="mask_only",
+            structure_scale=2,
+            idm_grid_size=4,
+            learned_upsampling=True,
+            dynamic_mask_weight=2.0,
+            edge_weight=0.5,
+        ).eval()
+        with torch.no_grad():
+            output = model(self._batch())
+        self.assertEqual(output["object_states"].shape[-2:], (32, 24))
+        self.assertEqual(output["reconstruction"].shape, (2, 2, 3, 64, 48))
+        self.assertEqual(model.idm.head.in_features, 32 * 4 * 4)
+        self.assertTrue(torch.isfinite(output["dynamic_mask_loss"]))
+        self.assertTrue(torch.isfinite(output["edge_loss"]))
+
 
 if __name__ == "__main__":
     unittest.main()

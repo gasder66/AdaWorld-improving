@@ -70,6 +70,11 @@ def main() -> None:
     model = BoxingObjectLAM(
         config["state_dim"], config["latent_dim"], config.get("fdm_type", "independent"),
         config.get("object_input_mode", "masked_rgb_mask"),
+        structure_scale=config.get("structure_scale", 4),
+        idm_grid_size=config.get("idm_grid_size", 1),
+        learned_upsampling=config.get("learned_upsampling", False),
+        dynamic_mask_weight=config.get("dynamic_mask_weight", 0.0),
+        edge_weight=config.get("edge_weight", 0.0),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     train = ConcatDataset([

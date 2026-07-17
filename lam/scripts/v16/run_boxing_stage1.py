@@ -150,6 +150,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--transition_gap", type=int, choices=[1, 4], default=4)
     parser.add_argument("--content_recolor_probability", type=float, default=0.0)
+    parser.add_argument("--structure_scale", type=int, choices=[2, 4], default=4)
+    parser.add_argument("--idm_grid_size", type=int, choices=[1, 2, 4], default=1)
+    parser.add_argument("--learned_upsampling", action="store_true")
+    parser.add_argument("--dynamic_mask_weight", type=float, default=0.0)
+    parser.add_argument("--edge_weight", type=float, default=0.0)
     args = parser.parse_args()
     if args.transition_index_dir and args.batch_size < 2:
         raise ValueError("transition-balanced training requires batch_size >= 2 for genuine same-object shuffle")
@@ -183,13 +188,28 @@ def main() -> None:
     )
     val_loader = DataLoader(val_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=0)
     model = BoxingObjectLAM(
-        args.state_dim, args.latent_dim, args.fdm_type, args.object_input_mode
+        args.state_dim, args.latent_dim, args.fdm_type, args.object_input_mode,
+        structure_scale=args.structure_scale,
+        idm_grid_size=args.idm_grid_size,
+        learned_upsampling=args.learned_upsampling,
+        dynamic_mask_weight=args.dynamic_mask_weight,
+        edge_weight=args.edge_weight,
     ).to(device)
     if args.init_checkpoint:
         initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
         source_type = initial.get("args", {}).get("fdm_type", "independent")
         source_input_mode = initial.get("args", {}).get("object_input_mode", "masked_rgb_mask")
-        if source_type == args.fdm_type and source_input_mode == args.object_input_mode:
+        source_scale = initial.get("args", {}).get("structure_scale", 4)
+        source_grid = initial.get("args", {}).get("idm_grid_size", 1)
+        source_learned_upsampling = initial.get("args", {}).get("learned_upsampling", False)
+        architecture_matches = (
+            source_type == args.fdm_type
+            and source_input_mode == args.object_input_mode
+            and source_scale == args.structure_scale
+            and source_grid == args.idm_grid_size
+            and source_learned_upsampling == args.learned_upsampling
+        )
+        if architecture_matches:
             model.load_state_dict(initial["model"])
         else:
             compatible = {}
@@ -202,7 +222,8 @@ def main() -> None:
                     compatible[target_key] = value
             missing, unexpected = model.load_state_dict(compatible, strict=False)
             print(
-                f"initialized compatible modules from {source_type}/{source_input_mode} checkpoint; "
+                f"initialized compatible modules from {source_type}/{source_input_mode}/"
+                f"scale{source_scale}/grid{source_grid} checkpoint; "
                 f"new {args.fdm_type} FDM parameters={len([key for key in missing if key.startswith('fdm.')])}, "
                 f"unexpected={len(unexpected)}"
             )
@@ -263,6 +284,7 @@ def main() -> None:
             for key in (
                 "loss", "state_loss", "reconstruction_loss", "object_rgb_loss",
                 "mask_dice_loss", "mask_iou",
+                "dynamic_mask_loss", "edge_loss",
                 "z_variance", "variance_floor_loss", "z_norm_loss", "action_contrast_loss",
             )
         }

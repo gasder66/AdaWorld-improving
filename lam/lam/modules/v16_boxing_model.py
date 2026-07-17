@@ -10,13 +10,16 @@ from torch import Tensor
 
 
 class SpatialVisualEncoder(nn.Module):
-    def __init__(self, in_channels: int = 4, state_dim: int = 96) -> None:
+    def __init__(
+        self, in_channels: int = 4, state_dim: int = 96, spatial_scale: int = 4
+    ) -> None:
         super().__init__()
+        if spatial_scale not in (2, 4):
+            raise ValueError(f"spatial_scale must be 2 or 4, got {spatial_scale}")
+        second_stride = 2 if spatial_scale == 4 else 1
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, 32, 5, stride=2, padding=2), nn.GroupNorm(4, 32), nn.GELU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.GroupNorm(8, 64), nn.GELU(),
-            # Keep H/4 spatial states. Boxing sprites are only ~14 px wide;
-            # H/8 reduced them to roughly two cells and destroyed contours.
+            nn.Conv2d(32, 64, 3, stride=second_stride, padding=1), nn.GroupNorm(8, 64), nn.GELU(),
             nn.Conv2d(64, state_dim, 3, stride=1, padding=1), nn.GroupNorm(8, state_dim), nn.GELU(),
         )
 
@@ -27,17 +30,21 @@ class SpatialVisualEncoder(nn.Module):
 class PerObjectIDM(nn.Module):
     """Infer z_i only from object i's adjacent visual states."""
 
-    def __init__(self, state_dim: int, latent_dim: int) -> None:
+    def __init__(self, state_dim: int, latent_dim: int, grid_size: int = 1) -> None:
         super().__init__()
+        if grid_size < 1:
+            raise ValueError("grid_size must be positive")
+        self.grid_size = grid_size
         self.compare = nn.Sequential(
             nn.Conv2d(state_dim * 3, state_dim, 1), nn.GELU(),
             nn.Conv2d(state_dim, state_dim, 3, padding=1), nn.GELU(),
         )
-        self.head = nn.Linear(state_dim, latent_dim)
+        self.head = nn.Linear(state_dim * grid_size * grid_size, latent_dim)
 
     def forward(self, state_t: Tensor, state_tp1: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         delta = state_tp1 - state_t
-        hidden = self.compare(torch.cat([state_t, state_tp1, delta], dim=1)).mean(dim=(-2, -1))
+        hidden = self.compare(torch.cat([state_t, state_tp1, delta], dim=1))
+        hidden = F.adaptive_avg_pool2d(hidden, self.grid_size).flatten(1)
         mu = self.head(hidden)
         logvar = torch.zeros_like(mu)
         z = mu
@@ -162,17 +169,33 @@ class InteractionObjectFDM(nn.Module):
 
 
 class SlotDecoder(nn.Module):
-    def __init__(self, state_dim: int, out_channels: int) -> None:
+    def __init__(
+        self, state_dim: int, out_channels: int, learned_scale: int | None = None
+    ) -> None:
         super().__init__()
+        self.learned_scale = learned_scale
         self.pre = nn.Sequential(
             nn.Conv2d(state_dim, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.GELU(),
             nn.Conv2d(64, 32, 3, padding=1), nn.GELU(),
         )
+        if learned_scale is not None:
+            if learned_scale not in (2, 4):
+                raise ValueError(f"learned_scale must be 2 or 4, got {learned_scale}")
+            self.upsample = nn.Sequential(
+                nn.Conv2d(32, 32 * learned_scale * learned_scale, 3, padding=1),
+                nn.PixelShuffle(learned_scale),
+                nn.GELU(),
+            )
+        else:
+            self.upsample = None
         self.out = nn.Conv2d(32, out_channels, 3, padding=1)
 
     def forward(self, state: Tensor, output_size: Tuple[int, int]) -> Tensor:
         hidden = self.pre(state)
-        hidden = F.interpolate(hidden, size=output_size, mode="bilinear", align_corners=False)
+        if self.upsample is not None:
+            hidden = self.upsample(hidden)
+        if hidden.shape[-2:] != output_size:
+            hidden = F.interpolate(hidden, size=output_size, mode="bilinear", align_corners=False)
         return self.out(hidden)
 
 
@@ -192,6 +215,11 @@ class BoxingObjectLAM(nn.Module):
         latent_dim: int = 16,
         fdm_type: str = "independent",
         object_input_mode: str = "masked_rgb_mask",
+        structure_scale: int = 4,
+        idm_grid_size: int = 1,
+        learned_upsampling: bool = False,
+        dynamic_mask_weight: float = 0.0,
+        edge_weight: float = 0.0,
     ) -> None:
         super().__init__()
         if object_input_mode not in self.OBJECT_INPUT_CHANNELS:
@@ -200,7 +228,14 @@ class BoxingObjectLAM(nn.Module):
         self.latent_dim = latent_dim
         self.fdm_type = fdm_type
         self.object_input_mode = object_input_mode
-        self.object_encoder = SpatialVisualEncoder(self.OBJECT_INPUT_CHANNELS[object_input_mode], state_dim)
+        self.structure_scale = structure_scale
+        self.idm_grid_size = idm_grid_size
+        self.learned_upsampling = learned_upsampling
+        self.dynamic_mask_weight = dynamic_mask_weight
+        self.edge_weight = edge_weight
+        self.object_encoder = SpatialVisualEncoder(
+            self.OBJECT_INPUT_CHANNELS[object_input_mode], state_dim, structure_scale
+        )
         self.background_encoder = SpatialVisualEncoder(4, state_dim)
         if object_input_mode == "mask_structure_content":
             # Content is pooled from the current RGB frame under each oracle
@@ -213,7 +248,7 @@ class BoxingObjectLAM(nn.Module):
             self.content_encoder = None
             self.content_state_norm = None
             self.content_conditioner = None
-        self.idm = PerObjectIDM(state_dim, latent_dim)
+        self.idm = PerObjectIDM(state_dim, latent_dim, idm_grid_size)
         if fdm_type == "independent":
             self.fdm = IndependentObjectFDM(state_dim, latent_dim)
         elif fdm_type == "interaction":
@@ -222,7 +257,9 @@ class BoxingObjectLAM(nn.Module):
             self.fdm = InteractionObjectFDM(state_dim, latent_dim, spatial_tokens=True)
         else:
             raise ValueError(f"unknown fdm_type: {fdm_type}")
-        self.object_decoder = SlotDecoder(state_dim, 4)
+        self.object_decoder = SlotDecoder(
+            state_dim, 4, structure_scale if learned_upsampling else None
+        )
         self.background_decoder = SlotDecoder(state_dim, 3)
 
     @staticmethod
@@ -253,14 +290,16 @@ class BoxingObjectLAM(nn.Module):
         background = videos * background_masks.unsqueeze(2)
         background_input = torch.cat([background, background_masks.unsqueeze(2)], dim=2)
         background_states = self.background_encoder(background_input.reshape(batch * time, 4, height, width))
-        background_states = background_states.reshape(batch, time, self.state_dim, sh, sw)
+        bh, bw = background_states.shape[-2:]
+        background_states = background_states.reshape(batch, time, self.state_dim, bh, bw)
         content_states = None
         if self.content_encoder is not None:
             content_map = self.content_encoder(videos.reshape(batch * time, 3, height, width))
+            ch, cw = content_map.shape[-2:]
             flat_masks = masks.reshape(batch * time * 2, 1, height, width)
             downsampled_masks = F.interpolate(
-                flat_masks, size=(sh, sw), mode="bilinear", align_corners=False
-            ).reshape(batch * time, 2, 1, sh, sw)
+                flat_masks, size=(ch, cw), mode="bilinear", align_corners=False
+            ).reshape(batch * time, 2, 1, ch, cw)
             weighted = content_map.unsqueeze(1) * downsampled_masks
             denominator = downsampled_masks.sum(dim=(-2, -1)).clamp_min(1e-6)
             content_states = (
@@ -369,7 +408,24 @@ class BoxingObjectLAM(nn.Module):
         negative = (1.0 - target_masks).sum().clamp_min(1.0)
         pos_weight = (negative / positive).detach().clamp(max=100.0)
         mask_bce = F.binary_cross_entropy_with_logits(object_mask_logits, target_masks, pos_weight=pos_weight)
+        current_masks = masks[:, :-1]
+        changed = (target_masks - current_masks).abs()
+        dynamic_region = F.max_pool2d(
+            changed.reshape(-1, 1, height, width), 7, stride=1, padding=3
+        ).reshape_as(changed).clamp(0.0, 1.0)
+        dynamic_bce_map = F.binary_cross_entropy_with_logits(
+            object_mask_logits, target_masks, reduction="none"
+        )
+        dynamic_mask_loss = (
+            (dynamic_bce_map * dynamic_region).sum(dim=(-2, -1))
+            / dynamic_region.sum(dim=(-2, -1)).clamp_min(1.0)
+        ).mean()
         probs = object_alpha
+        predicted_dx = probs[..., :, 1:] - probs[..., :, :-1]
+        target_dx = target_masks[..., :, 1:] - target_masks[..., :, :-1]
+        predicted_dy = probs[..., 1:, :] - probs[..., :-1, :]
+        target_dy = target_masks[..., 1:, :] - target_masks[..., :-1, :]
+        edge_loss = F.l1_loss(predicted_dx, target_dx) + F.l1_loss(predicted_dy, target_dy)
         dice = 1.0 - (
             (2.0 * (probs * target_masks).sum(dim=(-2, -1)) + 1.0)
             / (probs.sum(dim=(-2, -1)) + target_masks.sum(dim=(-2, -1)) + 1.0)
@@ -399,6 +455,8 @@ class BoxingObjectLAM(nn.Module):
             + object_rgb_weight * object_rgb_loss
             + mask_weight * mask_bce
             + mask_weight * dice
+            + self.dynamic_mask_weight * dynamic_mask_loss
+            + self.edge_weight * edge_loss
             + 0.25 * background_loss
             + 0.25 * reconstruction_loss
             + 0.1 * variance_floor_loss
@@ -412,6 +470,8 @@ class BoxingObjectLAM(nn.Module):
             "mask_bce": mask_bce,
             "mask_dice_loss": dice,
             "mask_iou": mask_iou,
+            "dynamic_mask_loss": dynamic_mask_loss,
+            "edge_loss": edge_loss,
             "background_loss": background_loss,
             "reconstruction_loss": reconstruction_loss,
             "kl_loss": kl,
