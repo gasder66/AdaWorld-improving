@@ -75,7 +75,8 @@ def _load_model(path: str, device: torch.device) -> BoxingObjectLAM:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     config = checkpoint["args"]
     model = BoxingObjectLAM(
-        config["state_dim"], config["latent_dim"], config.get("fdm_type", "independent")
+        config["state_dim"], config["latent_dim"], config.get("fdm_type", "independent"),
+        config.get("object_input_mode", "masked_rgb_mask"),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -288,7 +289,7 @@ def make_reconstructions(
         for key in ("videos", "masks", "background_masks")
     }
     outputs = {mode: model(batch, ablation=mode) for mode in ("normal", "zero", "shuffle")}
-    full_rows, zoom_rows, rows = [], [], []
+    full_rows, zoom_rows, mask_rows, rows = [], [], [], []
     for row, (index, sample) in enumerate(zip(indices, samples)):
         event = EVENT_NAMES[int(sample["interaction_id"])]
         slot = int(sample["target_slot"])
@@ -332,7 +333,41 @@ def make_reconstructions(
         draw.text((7, 8), event, fill=(248, 248, 248), font=_font(13))
         draw.text((7, 31), "target fighter", fill=(190, 190, 190), font=_font(11))
         zoom_rows.append(np.concatenate([np.asarray(zoom_header), *padded], axis=1))
-        rows.append({"index": index, "event": event, "slot": slot, **metrics})
+
+        mask_images = {
+            "current mask": sample["masks"][0, slot],
+            "target mask": sample["masks"][1, slot],
+            "normal z": torch.sigmoid(outputs["normal"]["object_mask_logits"][row, 0, slot].cpu()),
+            "zero z": torch.sigmoid(outputs["zero"]["object_mask_logits"][row, 0, slot].cpu()),
+            "shuffle z": torch.sigmoid(outputs["shuffle"]["object_mask_logits"][row, 0, slot].cpu()),
+        }
+        target_mask = mask_images["target mask"] >= 0.5
+        mask_metrics = {}
+        mask_panels = []
+        for name, mask in mask_images.items():
+            if name not in {"current mask", "target mask"}:
+                prediction = mask >= 0.5
+                intersection = float((prediction & target_mask).sum())
+                union = float((prediction | target_mask).sum())
+                mask_metrics[name] = intersection / max(1.0, union)
+            rgb_mask = mask.unsqueeze(0).repeat(3, 1, 1)[:, y0:y1, x0:x1]
+            subtitle = "" if name in {"current mask", "target mask"} else f"IoU={mask_metrics[name]:.3f}"
+            mask_panels.append(_label(_tensor_image(rgb_mask, 5), name, subtitle))
+        mask_height = max(panel.height for panel in mask_panels)
+        padded_masks = []
+        for panel in mask_panels:
+            canvas = Image.new("RGB", (panel.width, mask_height), (28, 28, 28))
+            canvas.paste(panel, (0, 0))
+            padded_masks.append(np.asarray(canvas))
+        mask_header = Image.new("RGB", (150, mask_height), (28, 28, 28))
+        draw = ImageDraw.Draw(mask_header)
+        draw.text((7, 8), event, fill=(248, 248, 248), font=_font(13))
+        draw.text((7, 31), "target mask", fill=(190, 190, 190), font=_font(11))
+        mask_rows.append(np.concatenate([np.asarray(mask_header), *padded_masks], axis=1))
+        rows.append({
+            "index": index, "event": event, "slot": slot, **metrics,
+            **{f"mask_iou_{name.replace(' ', '_')}": value for name, value in mask_metrics.items()},
+        })
 
     def save_rows(rows_array: Sequence[np.ndarray], name: str) -> None:
         width = max(row.shape[1] for row in rows_array)
@@ -341,6 +376,7 @@ def make_reconstructions(
 
     save_rows(full_rows, "reconstruction_full_frames.png")
     save_rows(zoom_rows, "reconstruction_fighter_zooms.png")
+    save_rows(mask_rows, "mask_prediction_zooms.png")
     return {"indices": list(indices), "rows": rows}
 
 

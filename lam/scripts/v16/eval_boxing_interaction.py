@@ -52,7 +52,10 @@ def evaluate(checkpoint_path: str, index_path: str, max_per_event: int, batch_si
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint["args"]
     fdm_type = config.get("fdm_type", "independent")
-    model = BoxingObjectLAM(config["state_dim"], config["latent_dim"], fdm_type).to(device)
+    model = BoxingObjectLAM(
+        config["state_dim"], config["latent_dim"], fdm_type,
+        config.get("object_input_mode", "masked_rgb_mask"),
+    ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     dataset = BoxingTransitionDataset(index_path)

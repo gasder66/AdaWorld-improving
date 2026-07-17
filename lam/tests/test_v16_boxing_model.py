@@ -25,6 +25,7 @@ class BoxingObjectLAMTest(unittest.TestCase):
         self.assertEqual(output["z"].shape, (2, 2, 2, 8))
         self.assertEqual(output["reconstruction"].shape, (2, 2, 3, 64, 48))
         self.assertTrue(torch.isfinite(output["loss"]))
+        self.assertTrue(torch.isfinite(output["mask_iou"]))
         self.assertTrue(
             torch.allclose(
                 zero_output["predicted_object_states"],
@@ -38,6 +39,28 @@ class BoxingObjectLAMTest(unittest.TestCase):
         with torch.no_grad():
             changed_output = model(changed)
         self.assertTrue(torch.allclose(output["z"][:, :, 0], changed_output["z"][:, :, 0], atol=1e-6))
+
+    def test_object_input_modes(self):
+        batch = self._batch()
+        for mode in ("masked_rgb_mask", "mask_only", "masked_rgb"):
+            model = BoxingObjectLAM(
+                state_dim=32, latent_dim=8, object_input_mode=mode
+            ).eval()
+            with torch.no_grad():
+                output = model(batch)
+            self.assertEqual(output["z"].shape, (2, 2, 2, 8))
+            expected_channels = BoxingObjectLAM.OBJECT_INPUT_CHANNELS[mode]
+            self.assertEqual(model.object_encoder.net[0].in_channels, expected_channels)
+
+        mask_model = BoxingObjectLAM(
+            state_dim=32, latent_dim=8, object_input_mode="mask_only"
+        ).eval()
+        changed = {key: value.clone() for key, value in batch.items()}
+        changed["videos"] = torch.rand_like(changed["videos"])
+        with torch.no_grad():
+            original = mask_model(batch)
+            recolored = mask_model(changed)
+        self.assertTrue(torch.allclose(original["z"], recolored["z"], atol=1e-6))
 
     def test_interaction_fdm_and_opponent_ablation(self):
         torch.manual_seed(1)

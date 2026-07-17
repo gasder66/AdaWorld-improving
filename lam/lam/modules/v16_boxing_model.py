@@ -179,12 +179,27 @@ class SlotDecoder(nn.Module):
 class BoxingObjectLAM(nn.Module):
     """Two dynamic fighter slots plus one action-free background slot."""
 
-    def __init__(self, state_dim: int = 96, latent_dim: int = 16, fdm_type: str = "independent") -> None:
+    OBJECT_INPUT_CHANNELS = {
+        "masked_rgb_mask": 4,
+        "mask_only": 1,
+        "masked_rgb": 3,
+    }
+
+    def __init__(
+        self,
+        state_dim: int = 96,
+        latent_dim: int = 16,
+        fdm_type: str = "independent",
+        object_input_mode: str = "masked_rgb_mask",
+    ) -> None:
         super().__init__()
+        if object_input_mode not in self.OBJECT_INPUT_CHANNELS:
+            raise ValueError(f"unknown object_input_mode: {object_input_mode}")
         self.state_dim = state_dim
         self.latent_dim = latent_dim
         self.fdm_type = fdm_type
-        self.object_encoder = SpatialVisualEncoder(4, state_dim)
+        self.object_input_mode = object_input_mode
+        self.object_encoder = SpatialVisualEncoder(self.OBJECT_INPUT_CHANNELS[object_input_mode], state_dim)
         self.background_encoder = SpatialVisualEncoder(4, state_dim)
         self.idm = PerObjectIDM(state_dim, latent_dim)
         if fdm_type == "independent":
@@ -211,8 +226,14 @@ class BoxingObjectLAM(nn.Module):
     def _encode_slots(self, videos: Tensor, masks: Tensor, background_masks: Tensor) -> Tuple[Tensor, Tensor]:
         batch, time, _, height, width = videos.shape
         objects = videos.unsqueeze(2) * masks.unsqueeze(3)
-        object_inputs = torch.cat([objects, masks.unsqueeze(3)], dim=3)
-        object_states = self.object_encoder(object_inputs.reshape(batch * time * 2, 4, height, width))
+        if self.object_input_mode == "masked_rgb_mask":
+            object_inputs = torch.cat([objects, masks.unsqueeze(3)], dim=3)
+        elif self.object_input_mode == "mask_only":
+            object_inputs = masks.unsqueeze(3)
+        else:
+            object_inputs = objects
+        channels = self.OBJECT_INPUT_CHANNELS[self.object_input_mode]
+        object_states = self.object_encoder(object_inputs.reshape(batch * time * 2, channels, height, width))
         sh, sw = object_states.shape[-2:]
         object_states = object_states.reshape(batch, time, 2, self.state_dim, sh, sw)
         background = videos * background_masks.unsqueeze(2)
@@ -304,6 +325,11 @@ class BoxingObjectLAM(nn.Module):
             (2.0 * (probs * target_masks).sum(dim=(-2, -1)) + 1.0)
             / (probs.sum(dim=(-2, -1)) + target_masks.sum(dim=(-2, -1)) + 1.0)
         ).mean()
+        predicted_binary_masks = probs >= 0.5
+        target_binary_masks = target_masks >= 0.5
+        intersection = (predicted_binary_masks & target_binary_masks).sum(dim=(-2, -1)).float()
+        union = (predicted_binary_masks | target_binary_masks).sum(dim=(-2, -1)).float().clamp_min(1.0)
+        mask_iou = (intersection / union).mean()
         bg_den = target_background.sum(dim=(-2, -1)).clamp_min(1.0)
         background_loss = (
             (background_rgb - target_video).abs() * target_background.unsqueeze(2)
@@ -316,11 +342,13 @@ class BoxingObjectLAM(nn.Module):
         variance_floor_loss = F.relu(0.1 - z_std).mean()
         z_norm_loss = mu.square().mean()
         identity_state_loss = F.mse_loss(state_t, state_tp1.detach())
+        object_rgb_weight = 0.25 if self.object_input_mode == "mask_only" else 1.0
+        mask_weight = 1.0 if self.object_input_mode == "mask_only" else 0.5
         total = (
             5.0 * state_loss
-            + object_rgb_loss
-            + 0.5 * mask_bce
-            + 0.5 * dice
+            + object_rgb_weight * object_rgb_loss
+            + mask_weight * mask_bce
+            + mask_weight * dice
             + 0.25 * background_loss
             + 0.25 * reconstruction_loss
             + 0.1 * variance_floor_loss
@@ -333,6 +361,7 @@ class BoxingObjectLAM(nn.Module):
             "object_rgb_loss": object_rgb_loss,
             "mask_bce": mask_bce,
             "mask_dice_loss": dice,
+            "mask_iou": mask_iou,
             "background_loss": background_loss,
             "reconstruction_loss": reconstruction_loss,
             "kl_loss": kl,

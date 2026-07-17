@@ -57,3 +57,17 @@ This file records milestone experiments for the V16 object-wise Boxing LAM. Indi
 - Original punch probe remains stable: linear `0.7550`, MLP `0.8096`, RBF-SVM `0.8093`; dx `0.8836`, dy `0.9785` R2.
 - Opponent-state masking raises target error most for hit and occlusion, but opponent-state shuffling is nearly neutral. Current evidence supports a small generic cross-object context benefit, not yet strong matching-specific interaction.
 - A position-aware visual-token variant is implemented as `spatial_interaction` but remains untrained. A batch-size guard now prevents transition training with batch `< 2`, because genuine same-object shuffle is impossible with one transition per object.
+
+### E05 — oracle-mask ObjectLAM
+
+- Purpose: test whether OCAtari masks can serve directly as a supervised object factorizer, removing RGB appearance from the IDM path while preserving object motion and punch information.
+- Model interface: `object_input_mode` supports `masked_rgb_mask` (the E04 default), `mask_only`, and `masked_rgb`. Old checkpoints default to `masked_rgb_mask` and remain loadable.
+- Mask-only invariant: object states and latents depend only on each fighter's one-channel oracle mask. RGB remains available only to the separate background encoder and auxiliary full-frame decoder.
+- `v16_e05a_mask_only_independent`: overall normal/zero/shuffle state MSE is `0.010812` / `0.017994` / `0.019088`; mask IoU is `0.9054` / `0.7609` / `0.7724`.
+- E05A event state MSE normal versus zero/shuffle remains favorable for all eight interaction classes. On occlusion it is `0.03201` versus `0.04220` / `0.05300`; on received-hit it is `0.01561` versus `0.02495` / `0.02695`.
+- `v16_e05b_mask_only_residual_transformer`: overall normal/zero/shuffle state MSE is `0.009725` / `0.017879` / `0.018761`; mask IoU is `0.9113` / `0.7615` / `0.7761`.
+- Relative to E05A, the residual Transformer lowers state MSE by approximately `10.1%` overall, `9.5%` on non-interaction, `8.2%` on contact, `5.5%` on hit, `9.4%` on received-hit, `9.0%` on occlusion, and `9.8%` on recovery.
+- E05B latent probes: punch-change linear `0.7158`, punch-active MLP `0.7898`, movement dx/dy `0.8892` / `0.9773` R2. On the balanced interaction manifold, direction balanced accuracy is `0.9263` and identity balanced accuracy is `0.8400`, down from E04's `0.9862` identity result.
+- Mask contours are substantially sharper and more directly interpretable than RGB reconstruction. The auxiliary RGB decoder still has rare catastrophic samples and is not the primary E05 quality criterion.
+- Opponent-state masking raises error slightly, but matched versus shuffled opponent state remains effectively identical. E05 therefore strengthens the generic cross-object context result but still does not establish matching-specific one-step interaction.
+- Conclusion: oracle masks are a viable and cleaner object-state interface for Atari. They preserve movement and punch semantics, make the matching latent necessary for future contour prediction, and reduce—but do not eliminate—fighter identity information.

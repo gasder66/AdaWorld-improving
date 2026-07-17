@@ -31,7 +31,8 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint["args"]
     model = BoxingObjectLAM(
-        config["state_dim"], config["latent_dim"], config.get("fdm_type", "independent")
+        config["state_dim"], config["latent_dim"], config.get("fdm_type", "independent"),
+        config.get("object_input_mode", "masked_rgb_mask"),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()

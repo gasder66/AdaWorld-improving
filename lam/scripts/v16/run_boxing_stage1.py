@@ -83,7 +83,10 @@ def evaluate(
         for batch in loader:
             model_batch = _model_batch(batch, device, transition_gap)
             out = model(model_batch, ablation=ablation)
-            for key in ("loss", "state_loss", "identity_state_loss", "reconstruction_loss", "object_rgb_loss", "z_variance"):
+            for key in (
+                "loss", "state_loss", "identity_state_loss", "reconstruction_loss",
+                "object_rgb_loss", "mask_dice_loss", "mask_iou", "z_variance",
+            ):
                 sums[key] = sums.get(key, 0.0) + float(out[key])
             count += 1
             if max_batches and count >= max_batches:
@@ -112,6 +115,11 @@ def main() -> None:
     parser.add_argument("--latent_dim", type=int, default=16)
     parser.add_argument(
         "--fdm_type", choices=["independent", "interaction", "spatial_interaction"], default="independent"
+    )
+    parser.add_argument(
+        "--object_input_mode",
+        choices=["masked_rgb_mask", "mask_only", "masked_rgb"],
+        default="masked_rgb_mask",
     )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gpu", type=int, default=0)
@@ -149,11 +157,14 @@ def main() -> None:
         sampler=train_sampler, num_workers=0, drop_last=True,
     )
     val_loader = DataLoader(val_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=0)
-    model = BoxingObjectLAM(args.state_dim, args.latent_dim, args.fdm_type).to(device)
+    model = BoxingObjectLAM(
+        args.state_dim, args.latent_dim, args.fdm_type, args.object_input_mode
+    ).to(device)
     if args.init_checkpoint:
         initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
         source_type = initial.get("args", {}).get("fdm_type", "independent")
-        if source_type == args.fdm_type:
+        source_input_mode = initial.get("args", {}).get("object_input_mode", "masked_rgb_mask")
+        if source_type == args.fdm_type and source_input_mode == args.object_input_mode:
             model.load_state_dict(initial["model"])
         else:
             compatible = {}
@@ -166,7 +177,7 @@ def main() -> None:
                     compatible[target_key] = value
             missing, unexpected = model.load_state_dict(compatible, strict=False)
             print(
-                f"initialized shared modules from {source_type} checkpoint; "
+                f"initialized compatible modules from {source_type}/{source_input_mode} checkpoint; "
                 f"new {args.fdm_type} FDM parameters={len([key for key in missing if key.startswith('fdm.')])}, "
                 f"unexpected={len(unexpected)}"
             )
@@ -184,15 +195,21 @@ def main() -> None:
             iterator = iter(train_loader)
             batch = next(iterator)
         out = model(_identity_batch(batch, device), ablation="zero")
+        object_rgb_weight = 0.25 if args.object_input_mode == "mask_only" else 1.0
         visual_loss = (
-            out["object_rgb_loss"] + 0.5 * out["mask_bce"] + 0.5 * out["mask_dice_loss"]
+            object_rgb_weight * out["object_rgb_loss"] + out["mask_bce"] + out["mask_dice_loss"]
             + 0.25 * out["background_loss"] + 0.25 * out["reconstruction_loss"]
         )
         optimizer.zero_grad(set_to_none=True)
         visual_loss.backward()
         torch.nn.utils.clip_grad_norm_((p for p in model.parameters() if p.requires_grad), 1.0)
         optimizer.step()
-        row = {"loss": float(visual_loss.detach()), "reconstruction_loss": float(out["reconstruction_loss"])}
+        row = {
+            "loss": float(visual_loss.detach()),
+            "reconstruction_loss": float(out["reconstruction_loss"]),
+            "mask_dice_loss": float(out["mask_dice_loss"]),
+            "mask_iou": float(out["mask_iou"]),
+        }
         history["visual"].append(row)
         if step % 20 == 0 or step + 1 == args.pretrain_steps:
             print(f"visual step={step:04d} " + " ".join(f"{k}={v:.5f}" for k, v in row.items()))
@@ -216,6 +233,7 @@ def main() -> None:
             key: float(out[key].detach())
             for key in (
                 "loss", "state_loss", "reconstruction_loss", "object_rgb_loss",
+                "mask_dice_loss", "mask_iou",
                 "z_variance", "variance_floor_loss", "z_norm_loss", "action_contrast_loss",
             )
         }
