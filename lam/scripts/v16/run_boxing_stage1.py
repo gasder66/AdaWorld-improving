@@ -93,6 +93,13 @@ def _set_phase(model: BoxingObjectLAM, phase: str) -> None:
     for module in modules:
         for parameter in module.parameters():
             parameter.requires_grad_(True)
+    if phase == "dynamics" and model.idm_type == "residual_st":
+        # E08A2 is a controlled residual test: the E07C convolutional IDM and
+        # FDM remain fixed while only the ST correction learns.
+        for parameter in model.idm.base.parameters():
+            parameter.requires_grad_(False)
+        for parameter in model.fdm.parameters():
+            parameter.requires_grad_(False)
 
 
 def evaluate(
@@ -152,6 +159,10 @@ def main() -> None:
     parser.add_argument("--content_recolor_probability", type=float, default=0.0)
     parser.add_argument("--structure_scale", type=int, choices=[2, 4], default=4)
     parser.add_argument("--idm_grid_size", type=int, choices=[1, 2, 4], default=1)
+    parser.add_argument("--idm_type", choices=["conv", "st", "residual_st"], default="conv")
+    parser.add_argument("--idm_token_grid", type=int, default=8)
+    parser.add_argument("--idm_layers", type=int, default=2)
+    parser.add_argument("--idm_heads", type=int, default=4)
     parser.add_argument("--learned_upsampling", action="store_true")
     parser.add_argument("--dynamic_mask_weight", type=float, default=0.0)
     parser.add_argument("--edge_weight", type=float, default=0.0)
@@ -191,6 +202,10 @@ def main() -> None:
         args.state_dim, args.latent_dim, args.fdm_type, args.object_input_mode,
         structure_scale=args.structure_scale,
         idm_grid_size=args.idm_grid_size,
+        idm_type=args.idm_type,
+        idm_token_grid=args.idm_token_grid,
+        idm_layers=args.idm_layers,
+        idm_heads=args.idm_heads,
         learned_upsampling=args.learned_upsampling,
         dynamic_mask_weight=args.dynamic_mask_weight,
         edge_weight=args.edge_weight,
@@ -201,12 +216,20 @@ def main() -> None:
         source_input_mode = initial.get("args", {}).get("object_input_mode", "masked_rgb_mask")
         source_scale = initial.get("args", {}).get("structure_scale", 4)
         source_grid = initial.get("args", {}).get("idm_grid_size", 1)
+        source_idm_type = initial.get("args", {}).get("idm_type", "conv")
+        source_idm_token_grid = initial.get("args", {}).get("idm_token_grid", 8)
+        source_idm_layers = initial.get("args", {}).get("idm_layers", 2)
+        source_idm_heads = initial.get("args", {}).get("idm_heads", 4)
         source_learned_upsampling = initial.get("args", {}).get("learned_upsampling", False)
         architecture_matches = (
             source_type == args.fdm_type
             and source_input_mode == args.object_input_mode
             and source_scale == args.structure_scale
             and source_grid == args.idm_grid_size
+            and source_idm_type == args.idm_type
+            and source_idm_token_grid == args.idm_token_grid
+            and source_idm_layers == args.idm_layers
+            and source_idm_heads == args.idm_heads
             and source_learned_upsampling == args.learned_upsampling
         )
         if architecture_matches:
@@ -218,12 +241,14 @@ def main() -> None:
                 target_key = key
                 if source_type == "independent" and args.fdm_type in {"interaction", "spatial_interaction"} and key.startswith("fdm."):
                     target_key = "fdm.base." + key[len("fdm."):]
+                if source_idm_type == "conv" and args.idm_type == "residual_st" and key.startswith("idm."):
+                    target_key = "idm.base." + key[len("idm."):]
                 if target_key in target_state and target_state[target_key].shape == value.shape:
                     compatible[target_key] = value
             missing, unexpected = model.load_state_dict(compatible, strict=False)
             print(
                 f"initialized compatible modules from {source_type}/{source_input_mode}/"
-                f"scale{source_scale}/grid{source_grid} checkpoint; "
+                f"scale{source_scale}/{source_idm_type}-IDM checkpoint; "
                 f"new {args.fdm_type} FDM parameters={len([key for key in missing if key.startswith('fdm.')])}, "
                 f"unexpected={len(unexpected)}"
             )

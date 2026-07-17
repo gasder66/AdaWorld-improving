@@ -133,6 +133,59 @@ class BoxingObjectLAMTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(output["dynamic_mask_loss"]))
         self.assertTrue(torch.isfinite(output["edge_loss"]))
 
+    def test_adaworld_style_spatiotemporal_idm(self):
+        torch.manual_seed(4)
+        model = BoxingObjectLAM(
+            state_dim=32,
+            latent_dim=8,
+            object_input_mode="mask_only",
+            structure_scale=2,
+            idm_type="st",
+            idm_token_grid=4,
+            idm_layers=2,
+            idm_heads=4,
+            learned_upsampling=True,
+        ).eval()
+        batch = self._batch()
+        with torch.no_grad():
+            output = model(batch)
+        self.assertEqual(output["z"].shape, (2, 2, 2, 8))
+        self.assertEqual(model.idm.spatial_position.shape, (1, 1, 17, 32))
+        self.assertTrue(torch.isfinite(output["loss"]))
+
+        changed = {key: value.clone() for key, value in batch.items()}
+        changed["masks"][:, :, 1] = changed["masks"][:, :, 1].roll(5, dims=-1)
+        changed["background_masks"] = 1 - changed["masks"].sum(dim=2).clamp(0, 1)
+        with torch.no_grad():
+            changed_output = model(changed)
+        self.assertTrue(
+            torch.allclose(output["z"][:, :, 0], changed_output["z"][:, :, 0], atol=1e-6)
+        )
+        self.assertFalse(
+            torch.allclose(output["z"][:, :, 1], changed_output["z"][:, :, 1])
+        )
+
+    def test_residual_spatiotemporal_idm_starts_near_conv_idm(self):
+        torch.manual_seed(5)
+        conv = BoxingObjectLAM(
+            state_dim=32, latent_dim=8, object_input_mode="mask_only",
+            structure_scale=2, idm_grid_size=4, idm_type="conv",
+        ).eval()
+        residual = BoxingObjectLAM(
+            state_dim=32, latent_dim=8, object_input_mode="mask_only",
+            structure_scale=2, idm_grid_size=4, idm_type="residual_st",
+            idm_token_grid=4, idm_layers=1, idm_heads=4,
+        ).eval()
+        residual.object_encoder.load_state_dict(conv.object_encoder.state_dict())
+        residual.idm.base.load_state_dict(conv.idm.state_dict())
+        batch = self._batch()
+        with torch.no_grad():
+            conv_output = conv(batch)
+            residual_output = residual(batch)
+        self.assertLess(
+            (conv_output["z"] - residual_output["z"]).abs().mean().item(), 0.02
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

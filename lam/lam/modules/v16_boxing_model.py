@@ -51,6 +51,123 @@ class PerObjectIDM(nn.Module):
         return z, mu, logvar
 
 
+class SpatioTemporalIDMBlock(nn.Module):
+    """AdaWorld-style factorized spatial then temporal attention."""
+
+    def __init__(self, state_dim: int, heads: int) -> None:
+        super().__init__()
+        self.spatial = nn.TransformerEncoderLayer(
+            d_model=state_dim,
+            nhead=heads,
+            dim_feedforward=state_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal = nn.TransformerEncoderLayer(
+            d_model=state_dim,
+            nhead=heads,
+            dim_feedforward=state_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        # tokens: [B,T,S,D]. Spatial attention is within a frame; temporal
+        # attention compares the same token position across the two frames.
+        batch, time, spatial, channels = tokens.shape
+        tokens = self.spatial(tokens.reshape(batch * time, spatial, channels))
+        tokens = tokens.reshape(batch, time, spatial, channels)
+        tokens = tokens.permute(0, 2, 1, 3).reshape(batch * spatial, time, channels)
+        tokens = self.temporal(tokens)
+        return tokens.reshape(batch, spatial, time, channels).permute(0, 2, 1, 3)
+
+
+class AdaWorldSpatioTemporalIDM(nn.Module):
+    """Two-frame object IDM modeled after AdaWorld's action-prompt encoder."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        latent_dim: int,
+        token_grid: int = 8,
+        layers: int = 2,
+        heads: int = 4,
+    ) -> None:
+        super().__init__()
+        if token_grid < 1:
+            raise ValueError("token_grid must be positive")
+        if layers < 1:
+            raise ValueError("layers must be positive")
+        if state_dim % heads:
+            raise ValueError(f"state_dim={state_dim} must be divisible by heads={heads}")
+        self.token_grid = token_grid
+        token_count = token_grid * token_grid
+        self.input_norm = nn.LayerNorm(state_dim)
+        self.action_prompt = nn.Parameter(torch.empty(1, 1, 1, state_dim))
+        self.spatial_position = nn.Parameter(torch.empty(1, 1, token_count + 1, state_dim))
+        self.temporal_position = nn.Parameter(torch.empty(1, 2, 1, state_dim))
+        self.blocks = nn.ModuleList(
+            [SpatioTemporalIDMBlock(state_dim, heads) for _ in range(layers)]
+        )
+        self.output_norm = nn.LayerNorm(state_dim)
+        self.output = nn.Linear(state_dim, latent_dim)
+        nn.init.normal_(self.action_prompt, mean=0.0, std=0.02)
+        nn.init.normal_(self.spatial_position, mean=0.0, std=0.02)
+        nn.init.normal_(self.temporal_position, mean=0.0, std=0.02)
+
+    def forward(self, state_t: Tensor, state_tp1: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        states = torch.stack([state_t, state_tp1], dim=1)
+        batch, time, channels, _, _ = states.shape
+        patches = F.adaptive_avg_pool2d(
+            states.reshape(batch * time, channels, *states.shape[-2:]),
+            (self.token_grid, self.token_grid),
+        ).flatten(2).transpose(1, 2)
+        patches = patches.reshape(batch, time, self.token_grid * self.token_grid, channels)
+        prompt = self.action_prompt.expand(batch, time, -1, -1)
+        tokens = torch.cat([prompt, patches], dim=2)
+        tokens = self.input_norm(tokens) + self.spatial_position + self.temporal_position
+        for block in self.blocks:
+            tokens = block(tokens)
+        # The second-frame prompt has compared both frames and summarizes the
+        # transition, matching the information path used by original AdaWorld.
+        mu = self.output(self.output_norm(tokens[:, 1, 0]))
+        logvar = torch.zeros_like(mu)
+        return mu, mu, logvar
+
+
+class ResidualSpatioTemporalIDM(nn.Module):
+    """Preserve a trained convolutional IDM and learn a small ST correction."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        latent_dim: int,
+        conv_grid_size: int = 4,
+        token_grid: int = 8,
+        layers: int = 2,
+        heads: int = 4,
+    ) -> None:
+        super().__init__()
+        self.base = PerObjectIDM(state_dim, latent_dim, conv_grid_size)
+        self.st = AdaWorldSpatioTemporalIDM(
+            state_dim, latent_dim, token_grid, layers, heads
+        )
+        # Start close to the proven convolutional IDM while retaining a
+        # non-zero gradient path into the new ST branch.
+        self.residual_logit = nn.Parameter(torch.tensor(-4.6))
+
+    def forward(self, state_t: Tensor, state_tp1: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        _, base_mu, _ = self.base(state_t, state_tp1)
+        _, correction, _ = self.st(state_t, state_tp1)
+        mu = base_mu + torch.sigmoid(self.residual_logit) * correction
+        logvar = torch.zeros_like(mu)
+        return mu, mu, logvar
+
+
 class IndependentObjectFDM(nn.Module):
     """Stage-1 FDM; shared parameters, no cross-object information."""
 
@@ -217,6 +334,10 @@ class BoxingObjectLAM(nn.Module):
         object_input_mode: str = "masked_rgb_mask",
         structure_scale: int = 4,
         idm_grid_size: int = 1,
+        idm_type: str = "conv",
+        idm_token_grid: int = 8,
+        idm_layers: int = 2,
+        idm_heads: int = 4,
         learned_upsampling: bool = False,
         dynamic_mask_weight: float = 0.0,
         edge_weight: float = 0.0,
@@ -230,6 +351,10 @@ class BoxingObjectLAM(nn.Module):
         self.object_input_mode = object_input_mode
         self.structure_scale = structure_scale
         self.idm_grid_size = idm_grid_size
+        self.idm_type = idm_type
+        self.idm_token_grid = idm_token_grid
+        self.idm_layers = idm_layers
+        self.idm_heads = idm_heads
         self.learned_upsampling = learned_upsampling
         self.dynamic_mask_weight = dynamic_mask_weight
         self.edge_weight = edge_weight
@@ -248,7 +373,19 @@ class BoxingObjectLAM(nn.Module):
             self.content_encoder = None
             self.content_state_norm = None
             self.content_conditioner = None
-        self.idm = PerObjectIDM(state_dim, latent_dim, idm_grid_size)
+        if idm_type == "conv":
+            self.idm = PerObjectIDM(state_dim, latent_dim, idm_grid_size)
+        elif idm_type == "st":
+            self.idm = AdaWorldSpatioTemporalIDM(
+                state_dim, latent_dim, idm_token_grid, idm_layers, idm_heads
+            )
+        elif idm_type == "residual_st":
+            self.idm = ResidualSpatioTemporalIDM(
+                state_dim, latent_dim, idm_grid_size,
+                idm_token_grid, idm_layers, idm_heads,
+            )
+        else:
+            raise ValueError(f"unknown idm_type: {idm_type}")
         if fdm_type == "independent":
             self.fdm = IndependentObjectFDM(state_dim, latent_dim)
         elif fdm_type == "interaction":
