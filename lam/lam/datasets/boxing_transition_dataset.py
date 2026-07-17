@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
@@ -60,6 +61,11 @@ class BoxingTransitionDataset(Dataset):
             for entry in index["entries"]
             if int(entry["transition"]) >= temporal_context - 1
         ]
+        resolved_index = Path(index_path).resolve()
+        self.project_root = next(
+            (parent for parent in resolved_index.parents if (parent / "data").is_dir()),
+            None,
+        )
         self.stats = index["stats"]
         if not self.entries:
             raise ValueError(f"empty transition index: {index_path}")
@@ -69,7 +75,12 @@ class BoxingTransitionDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         entry = self.entries[index]
-        raw = torch.load(entry["path"], map_location="cpu", weights_only=False)
+        sample_path = Path(entry["path"])
+        if not sample_path.exists() and self.project_root is not None:
+            parts = sample_path.parts
+            if "data" in parts:
+                sample_path = self.project_root.joinpath(*parts[parts.index("data") :])
+        raw = torch.load(sample_path, map_location="cpu", weights_only=False)
         t = int(entry["transition"])
         frame_indices = torch.arange(t - self.temporal_context + 1, t + 2)
         videos = raw["videos"].index_select(0, frame_indices).float() / 255.0
