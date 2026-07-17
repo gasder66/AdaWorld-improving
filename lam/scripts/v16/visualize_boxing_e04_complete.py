@@ -83,6 +83,10 @@ def _load_model(path: str, device: torch.device) -> BoxingObjectLAM:
         idm_token_grid=config.get("idm_token_grid", 8),
         idm_layers=config.get("idm_layers", 2),
         idm_heads=config.get("idm_heads", 4),
+        temporal_context=config.get("temporal_context", 1),
+        temporal_token_grid=config.get("temporal_token_grid", 8),
+        temporal_layers=config.get("temporal_layers", 2),
+        temporal_heads=config.get("temporal_heads", 4),
         learned_upsampling=config.get("learned_upsampling", False),
         dynamic_mask_weight=config.get("dynamic_mask_weight", 0.0),
         edge_weight=config.get("edge_weight", 0.0),
@@ -302,9 +306,9 @@ def make_reconstructions(
     for row, (index, sample) in enumerate(zip(indices, samples)):
         event = EVENT_NAMES[int(sample["interaction_id"])]
         slot = int(sample["target_slot"])
-        target = sample["videos"][1]
+        target = sample["videos"][-1]
         images = {
-            "current": sample["videos"][0],
+            "current": sample["videos"][-2],
             "target": target,
             "normal z": outputs["normal"]["reconstruction"][row, 0].cpu(),
             "zero z": outputs["zero"]["reconstruction"][row, 0].cpu(),
@@ -344,8 +348,8 @@ def make_reconstructions(
         zoom_rows.append(np.concatenate([np.asarray(zoom_header), *padded], axis=1))
 
         mask_images = {
-            "current mask": sample["masks"][0, slot],
-            "target mask": sample["masks"][1, slot],
+            "current mask": sample["masks"][-2, slot],
+            "target mask": sample["masks"][-1, slot],
             "normal z": torch.sigmoid(outputs["normal"]["object_mask_logits"][row, 0, slot].cpu()),
             "zero z": torch.sigmoid(outputs["zero"]["object_mask_logits"][row, 0, slot].cpu()),
             "shuffle z": torch.sigmoid(outputs["shuffle"]["object_mask_logits"][row, 0, slot].cpu()),
@@ -401,8 +405,10 @@ def main() -> None:
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    dataset = BoxingTransitionDataset(args.index)
     model = _load_model(args.checkpoint, device)
+    dataset = BoxingTransitionDataset(
+        args.index, temporal_context=model.temporal_context
+    )
     indices = _balanced_indices(dataset, args.points_per_event, args.seed)
     values = collect_latents(model, dataset, indices, device, args.batch_size)
     manifold = make_manifold(values, args.output_dir, args.seed)

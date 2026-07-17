@@ -34,15 +34,22 @@ def _write_experiment_manifest(output: str, manifest: Dict) -> None:
 
 
 @torch.no_grad()
-def _model_batch(batch: Dict[str, torch.Tensor], device: torch.device, transition_gap: int) -> Dict[str, torch.Tensor]:
+def _model_batch(
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    transition_gap: int,
+    temporal_context: int,
+) -> Dict[str, torch.Tensor]:
     result = {k: batch[k].to(device) for k in ("videos", "masks", "background_masks")}
-    if transition_gap > 1:
+    if transition_gap > 1 and temporal_context == 1:
         indices = torch.tensor([0, result["videos"].shape[1] - 1], device=device)
         result = {key: value.index_select(1, indices) for key, value in result.items()}
     return result
 
 
-def _identity_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+def _identity_batch(
+    batch: Dict[str, torch.Tensor], device: torch.device, temporal_context: int
+) -> Dict[str, torch.Tensor]:
     videos = batch["videos"].to(device)
     masks = batch["masks"].to(device)
     background = batch["background_masks"].to(device)
@@ -51,9 +58,11 @@ def _identity_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dic
     masks = masks.reshape(batch_size * time, *masks.shape[2:])
     background = background.reshape(batch_size * time, *background.shape[2:])
     return {
-        "videos": videos.unsqueeze(1).expand(-1, 2, -1, -1, -1),
-        "masks": masks.unsqueeze(1).expand(-1, 2, -1, -1, -1),
-        "background_masks": background.unsqueeze(1).expand(-1, 2, -1, -1),
+        "videos": videos.unsqueeze(1).expand(-1, temporal_context + 1, -1, -1, -1),
+        "masks": masks.unsqueeze(1).expand(-1, temporal_context + 1, -1, -1, -1),
+        "background_masks": background.unsqueeze(1).expand(
+            -1, temporal_context + 1, -1, -1
+        ),
     }
 
 
@@ -87,7 +96,9 @@ def _set_phase(model: BoxingObjectLAM, phase: str) -> None:
         if model.content_encoder is not None:
             modules.extend([model.content_encoder, model.content_conditioner])
     elif phase == "dynamics":
-        modules = (model.idm, model.fdm)
+        modules = [model.idm, model.fdm]
+        if model.temporal_encoder is not None:
+            modules.append(model.temporal_encoder)
     else:
         raise ValueError(phase)
     for module in modules:
@@ -112,7 +123,9 @@ def evaluate(
         sums: Dict[str, float] = {}
         count = 0
         for batch in loader:
-            model_batch = _model_batch(batch, device, transition_gap)
+            model_batch = _model_batch(
+                batch, device, transition_gap, model.temporal_context
+            )
             out = model(model_batch, ablation=ablation)
             for key in (
                 "loss", "state_loss", "identity_state_loss", "reconstruction_loss",
@@ -163,6 +176,10 @@ def main() -> None:
     parser.add_argument("--idm_token_grid", type=int, default=8)
     parser.add_argument("--idm_layers", type=int, default=2)
     parser.add_argument("--idm_heads", type=int, default=4)
+    parser.add_argument("--temporal_context", type=int, choices=[1, 3, 5], default=1)
+    parser.add_argument("--temporal_token_grid", type=int, default=8)
+    parser.add_argument("--temporal_layers", type=int, default=2)
+    parser.add_argument("--temporal_heads", type=int, default=4)
     parser.add_argument("--learned_upsampling", action="store_true")
     parser.add_argument("--dynamic_mask_weight", type=float, default=0.0)
     parser.add_argument("--edge_weight", type=float, default=0.0)
@@ -182,8 +199,14 @@ def main() -> None:
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     train_sampler = None
     if args.transition_index_dir:
-        train_ds = BoxingTransitionDataset(os.path.join(args.transition_index_dir, "train.pt"))
-        val_ds = BoxingTransitionDataset(os.path.join(args.transition_index_dir, "val.pt"))
+        train_ds = BoxingTransitionDataset(
+            os.path.join(args.transition_index_dir, "train.pt"),
+            temporal_context=args.temporal_context,
+        )
+        val_ds = BoxingTransitionDataset(
+            os.path.join(args.transition_index_dir, "val.pt"),
+            temporal_context=args.temporal_context,
+        )
         train_sampler = train_ds.balanced_sampler(args.balanced_samples or None, args.seed, args.balance_mode)
     else:
         train_parts = [BoxingObjectDataset(os.path.join(args.data_root, "train"), args.max_train_samples, target_frames=5)]
@@ -206,6 +229,10 @@ def main() -> None:
         idm_token_grid=args.idm_token_grid,
         idm_layers=args.idm_layers,
         idm_heads=args.idm_heads,
+        temporal_context=args.temporal_context,
+        temporal_token_grid=args.temporal_token_grid,
+        temporal_layers=args.temporal_layers,
+        temporal_heads=args.temporal_heads,
         learned_upsampling=args.learned_upsampling,
         dynamic_mask_weight=args.dynamic_mask_weight,
         edge_weight=args.edge_weight,
@@ -220,6 +247,10 @@ def main() -> None:
         source_idm_token_grid = initial.get("args", {}).get("idm_token_grid", 8)
         source_idm_layers = initial.get("args", {}).get("idm_layers", 2)
         source_idm_heads = initial.get("args", {}).get("idm_heads", 4)
+        source_temporal_context = initial.get("args", {}).get("temporal_context", 1)
+        source_temporal_token_grid = initial.get("args", {}).get("temporal_token_grid", 8)
+        source_temporal_layers = initial.get("args", {}).get("temporal_layers", 2)
+        source_temporal_heads = initial.get("args", {}).get("temporal_heads", 4)
         source_learned_upsampling = initial.get("args", {}).get("learned_upsampling", False)
         architecture_matches = (
             source_type == args.fdm_type
@@ -230,6 +261,10 @@ def main() -> None:
             and source_idm_token_grid == args.idm_token_grid
             and source_idm_layers == args.idm_layers
             and source_idm_heads == args.idm_heads
+            and source_temporal_context == args.temporal_context
+            and source_temporal_token_grid == args.temporal_token_grid
+            and source_temporal_layers == args.temporal_layers
+            and source_temporal_heads == args.temporal_heads
             and source_learned_upsampling == args.learned_upsampling
         )
         if architecture_matches:
@@ -265,7 +300,10 @@ def main() -> None:
         except StopIteration:
             iterator = iter(train_loader)
             batch = next(iterator)
-        visual_batch = _recolor_objects(_identity_batch(batch, device), args.content_recolor_probability)
+        visual_batch = _recolor_objects(
+            _identity_batch(batch, device, args.temporal_context),
+            args.content_recolor_probability,
+        )
         out = model(visual_batch, ablation="zero")
         object_rgb_weight = 0.25 if args.object_input_mode == "mask_only" else 1.0
         visual_loss = (
@@ -296,7 +334,7 @@ def main() -> None:
             iterator = iter(train_loader)
             batch = next(iterator)
         model_batch = _recolor_objects(
-            _model_batch(batch, device, args.transition_gap),
+            _model_batch(batch, device, args.transition_gap, args.temporal_context),
             args.content_recolor_probability,
         )
         out = model(model_batch)

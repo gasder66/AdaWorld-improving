@@ -36,9 +36,13 @@ def collect(model, dataset, device):
     for batch in loader:
         model_batch = {key: batch[key].to(device) for key in ("videos", "masks", "background_masks")}
         z = model(model_batch)["z_mu"].cpu().numpy()
-        next_arm = batch["arm_lengths"][:, 1:].numpy()
-        arm_delta = (batch["arm_lengths"][:, 1:] - batch["arm_lengths"][:, :-1]).numpy()
-        motion = batch["delta_xy"].numpy()
+        start = model.temporal_context
+        next_arm = batch["arm_lengths"][:, start:].numpy()
+        arm_delta = (
+            batch["arm_lengths"][:, start:]
+            - batch["arm_lengths"][:, start - 1 : -1]
+        ).numpy()
+        motion = batch["delta_xy"][:, start - 1 :].numpy()
         for b in range(z.shape[0]):
             for t in range(z.shape[1]):
                 for slot in range(2):
@@ -86,6 +90,19 @@ def main() -> None:
     model = BoxingObjectLAM(
         config["state_dim"], config["latent_dim"], config.get("fdm_type", "independent"),
         config.get("object_input_mode", "masked_rgb_mask"),
+        structure_scale=config.get("structure_scale", 4),
+        idm_grid_size=config.get("idm_grid_size", 1),
+        idm_type=config.get("idm_type", "conv"),
+        idm_token_grid=config.get("idm_token_grid", 8),
+        idm_layers=config.get("idm_layers", 2),
+        idm_heads=config.get("idm_heads", 4),
+        temporal_context=config.get("temporal_context", 1),
+        temporal_token_grid=config.get("temporal_token_grid", 8),
+        temporal_layers=config.get("temporal_layers", 2),
+        temporal_heads=config.get("temporal_heads", 4),
+        learned_upsampling=config.get("learned_upsampling", False),
+        dynamic_mask_weight=config.get("dynamic_mask_weight", 0.0),
+        edge_weight=config.get("edge_weight", 0.0),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     dataset = ConcatDataset([

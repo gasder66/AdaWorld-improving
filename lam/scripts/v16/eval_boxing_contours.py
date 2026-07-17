@@ -39,6 +39,10 @@ def _load_model(path: str, device: torch.device) -> BoxingObjectLAM:
         idm_token_grid=config.get("idm_token_grid", 8),
         idm_layers=config.get("idm_layers", 2),
         idm_heads=config.get("idm_heads", 4),
+        temporal_context=config.get("temporal_context", 1),
+        temporal_token_grid=config.get("temporal_token_grid", 8),
+        temporal_layers=config.get("temporal_layers", 2),
+        temporal_heads=config.get("temporal_heads", 4),
         learned_upsampling=config.get("learned_upsampling", False),
         dynamic_mask_weight=config.get("dynamic_mask_weight", 0.0),
         edge_weight=config.get("edge_weight", 0.0),
@@ -143,14 +147,21 @@ def evaluate(
         output = model(batch)
         height, width = batch["videos"].shape[-2:]
         content = output["content_states"]
-        content_t = None if content is None else content[:, :-1]
+        content_t = (
+            None
+            if content is None
+            else content[:, model.temporal_context - 1 : -1]
+        )
         oracle_probability = _decode_masks(
-            model, output["object_states"][:, 1:], content_t, (height, width)
+            model,
+            output["object_states"][:, model.temporal_context :],
+            content_t,
+            (height, width),
         )[:, 0]
         predicted_probability = torch.sigmoid(output["object_mask_logits"][:, 0])
         slots = raw["target_slot"].to(device)
-        current = _select_slot(batch["masks"][:, 0], slots)
-        target = _select_slot(batch["masks"][:, 1], slots)
+        current = _select_slot(batch["masks"][:, -2], slots)
+        target = _select_slot(batch["masks"][:, -1], slots)
         probabilities = {
             "oracle_state": _select_slot(oracle_probability, slots),
             "predicted_state": _select_slot(predicted_probability, slots),
@@ -238,12 +249,21 @@ def visualize(
         output = model(batch)
         height, width = batch["videos"].shape[-2:]
         content = output["content_states"]
-        content_t = None if content is None else content[:, :-1]
-        oracle = _decode_masks(model, output["object_states"][:, 1:], content_t, (height, width))[0, 0]
+        content_t = (
+            None
+            if content is None
+            else content[:, model.temporal_context - 1 : -1]
+        )
+        oracle = _decode_masks(
+            model,
+            output["object_states"][:, model.temporal_context :],
+            content_t,
+            (height, width),
+        )[0, 0]
         predicted = torch.sigmoid(output["object_mask_logits"][0, 0])
         slot = int(sample["target_slot"])
-        current = sample["masks"][0, slot]
-        target = sample["masks"][1, slot]
+        current = sample["masks"][-2, slot]
+        target = sample["masks"][-1, slot]
         oracle = oracle[slot].cpu()
         predicted = predicted[slot].cpu()
         x0, y0, x1, y1 = _bounds(torch.stack([current, target]), pad=12)
@@ -310,8 +330,10 @@ def main() -> None:
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    dataset = BoxingTransitionDataset(args.index)
     model = _load_model(args.checkpoint, device)
+    dataset = BoxingTransitionDataset(
+        args.index, temporal_context=model.temporal_context
+    )
     indices = _phase_indices(dataset, args.per_phase, args.seed)
     report = {
         "checkpoint": args.checkpoint,

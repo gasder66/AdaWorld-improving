@@ -40,6 +40,10 @@ def load_model(path: str, device: torch.device) -> BoxingObjectLAM:
         idm_token_grid=config.get("idm_token_grid", 8),
         idm_layers=config.get("idm_layers", 2),
         idm_heads=config.get("idm_heads", 4),
+        temporal_context=config.get("temporal_context", 1),
+        temporal_token_grid=config.get("temporal_token_grid", 8),
+        temporal_layers=config.get("temporal_layers", 2),
+        temporal_heads=config.get("temporal_heads", 4),
         learned_upsampling=config.get("learned_upsampling", False),
         dynamic_mask_weight=config.get("dynamic_mask_weight", 0.0),
         edge_weight=config.get("edge_weight", 0.0),
@@ -133,8 +137,12 @@ def main() -> None:
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     model = load_model(args.checkpoint, device)
-    train_dataset = BoxingTransitionDataset(args.train_index)
-    val_dataset = BoxingTransitionDataset(args.val_index)
+    train_dataset = BoxingTransitionDataset(
+        args.train_index, temporal_context=model.temporal_context
+    )
+    val_dataset = BoxingTransitionDataset(
+        args.val_index, temporal_context=model.temporal_context
+    )
     train_indices = balanced_indices(train_dataset, args.train_per_phase, args.seed)
     val_indices = balanced_indices(val_dataset, args.val_per_phase, args.seed + 1)
     train_x, train_y = collect(

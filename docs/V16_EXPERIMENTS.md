@@ -110,5 +110,24 @@ This file records milestone experiments for the V16 object-wise Boxing LAM. Indi
 - Six-way phase balanced accuracy also falls: linear/MLP is `0.3713` / `0.4027`, compared with E07C's `0.4617` / `0.5370`. This rules out the interpretation that reconstruction alone failed while ST latents became more semantic.
 - Residual ST-IDM (`v16_e08a2_residual_st_idm`) retains the trained E07C convolutional IDM and adds a gated ST correction. The base IDM and FDM are frozen, so the experiment tests only incremental information supplied by two-frame ST attention.
 - The residual design preserves the baseline: normal/zero/shuffle mask IoU is `0.9973` / `0.7595` / `0.8475`, state MSE is `0.00708`, phase-balanced target-slot contour IoU is `0.9088`, and dynamic-region IoU is `0.7751`.
+
+### E08B — causal temporal feature encoder
+
+- Purpose: test temporal attention as part of object-state feature extraction,
+  rather than as a replacement or residual branch inside the IDM.
+- Each per-frame high-resolution state still comes from the proven E07C
+  stride-2 CNN. A shared temporal Transformer pools each state to an `8x8`
+  grid, attends over an exact three-frame object history, upsamples a temporal
+  correction, and adds it residually to the final-frame CNN feature map.
+- For transition `t -> t+1`, the model constructs `h_t` only from
+  `[t-2, t-1, t]` and constructs `h_t+1` from `[t-1, t, t+1]`. The FDM receives
+  `h_t` and therefore cannot access the target frame. The unchanged convolutional
+  IDM infers `z_t = IDM(h_t, h_t+1)`.
+- The transition dataset drops entries without two preceding frames and returns
+  four frames per indexed transition. Existing two-frame behavior remains the
+  default when `--temporal_context 1`.
+- Initial CPU smoke tests successfully load E07C weights, train the new temporal
+  branch, and preserve high mask reconstruction. Full phase-balanced training
+  and phase/contour/manifold evaluation remain pending GPU availability.
 - It supplies no measurable phase benefit. Six-way linear/MLP balanced accuracy is `0.4613` / `0.5363`, effectively identical to E07C's `0.4617` / `0.5370`.
 - Conclusion: two-frame ST attention is neither a drop-in replacement for the current IDM nor an incremental source of phase semantics. A longer window must be paired with a phase-sensitive self-supervised objective; merely allowing attention over more frames is unlikely to be used when the ordinary one-step reconstruction target is already determined by the final frame pair.

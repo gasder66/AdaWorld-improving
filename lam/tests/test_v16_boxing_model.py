@@ -186,6 +186,51 @@ class BoxingObjectLAMTest(unittest.TestCase):
             (conv_output["z"] - residual_output["z"]).abs().mean().item(), 0.02
         )
 
+    def test_causal_temporal_feature_encoder_uses_exact_three_frame_windows(self):
+        torch.manual_seed(6)
+        model = BoxingObjectLAM(
+            state_dim=32,
+            latent_dim=8,
+            object_input_mode="mask_only",
+            structure_scale=2,
+            idm_grid_size=4,
+            temporal_context=3,
+            temporal_token_grid=4,
+            temporal_layers=1,
+            temporal_heads=4,
+            learned_upsampling=True,
+        ).eval()
+        base = self._batch()
+        batch = {
+            key: torch.cat([value, value[:, -1:]], dim=1)
+            for key, value in base.items()
+        }
+        with torch.no_grad():
+            output = model(batch)
+        self.assertEqual(output["z"].shape, (2, 1, 2, 8))
+        self.assertEqual(output["contextual_object_states"].shape[:3], (2, 2, 2))
+        self.assertEqual(output["reconstruction"].shape, (2, 1, 3, 64, 48))
+
+        changed = {key: value.clone() for key, value in batch.items()}
+        changed["masks"][:, -1, 0] = changed["masks"][:, -1, 0].roll(7, dims=-1)
+        changed["background_masks"] = 1 - changed["masks"].sum(dim=2).clamp(0, 1)
+        with torch.no_grad():
+            changed_output = model(changed)
+        # The h_t window ends before the modified target frame.
+        self.assertTrue(
+            torch.allclose(
+                output["contextual_object_states"][:, 0],
+                changed_output["contextual_object_states"][:, 0],
+                atol=1e-6,
+            )
+        )
+        self.assertFalse(
+            torch.allclose(
+                output["contextual_object_states"][:, 1, 0],
+                changed_output["contextual_object_states"][:, 1, 0],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

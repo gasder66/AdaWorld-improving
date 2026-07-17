@@ -50,9 +50,16 @@ DEFAULT_INTERACTION_PROBABILITIES = {
 
 
 class BoxingTransitionDataset(Dataset):
-    def __init__(self, index_path: str) -> None:
+    def __init__(self, index_path: str, temporal_context: int = 1) -> None:
         index = torch.load(index_path, map_location="cpu", weights_only=False)
-        self.entries: List[Dict[str, Any]] = index["entries"]
+        if temporal_context < 1:
+            raise ValueError("temporal_context must be positive")
+        self.temporal_context = temporal_context
+        self.entries: List[Dict[str, Any]] = [
+            entry
+            for entry in index["entries"]
+            if int(entry["transition"]) >= temporal_context - 1
+        ]
         self.stats = index["stats"]
         if not self.entries:
             raise ValueError(f"empty transition index: {index_path}")
@@ -64,7 +71,7 @@ class BoxingTransitionDataset(Dataset):
         entry = self.entries[index]
         raw = torch.load(entry["path"], map_location="cpu", weights_only=False)
         t = int(entry["transition"])
-        frame_indices = torch.tensor([t, t + 1])
+        frame_indices = torch.arange(t - self.temporal_context + 1, t + 2)
         videos = raw["videos"].index_select(0, frame_indices).float() / 255.0
         masks = raw["masks"].index_select(0, frame_indices).float()
         background = raw["background_masks"].index_select(0, frame_indices).float()
@@ -75,10 +82,10 @@ class BoxingTransitionDataset(Dataset):
             "masks": masks,
             "background_masks": background,
             "valid_mask": raw["valid_mask"].index_select(0, frame_indices).bool(),
-            "delta_xy": centers[1:] - centers[:-1],
-            "arm_lengths": arms,
-            "arm_delta": arms[1:] - arms[:-1],
-            "punch_labels": (arms != 0).any(dim=-1).long(),
+            "delta_xy": centers[-1:] - centers[-2:-1],
+            "arm_lengths": arms[-2:],
+            "arm_delta": arms[-1:] - arms[-2:-1],
+            "punch_labels": (arms[-2:] != 0).any(dim=-1).long(),
             "event_id": EVENT_TO_ID[entry["event"]],
             "interaction_id": INTERACTION_TO_ID[entry.get("interaction_primary", "non_interaction")],
             "target_slot": int(entry["target_slot"]),

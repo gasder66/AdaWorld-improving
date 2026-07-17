@@ -27,6 +27,88 @@ class SpatialVisualEncoder(nn.Module):
         return self.net(x)
 
 
+class CausalTemporalFeatureEncoder(nn.Module):
+    """Add short-history context to a high-resolution per-frame CNN state."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        context_frames: int = 3,
+        token_grid: int = 8,
+        layers: int = 2,
+        heads: int = 4,
+    ) -> None:
+        super().__init__()
+        if context_frames < 2:
+            raise ValueError("context_frames must be at least 2")
+        if token_grid < 1:
+            raise ValueError("token_grid must be positive")
+        if layers < 1:
+            raise ValueError("layers must be positive")
+        if state_dim % heads:
+            raise ValueError(f"state_dim={state_dim} must be divisible by heads={heads}")
+        self.context_frames = context_frames
+        self.token_grid = token_grid
+        self.temporal_position = nn.Parameter(
+            torch.empty(1, context_frames, state_dim)
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=state_dim,
+            nhead=heads,
+            dim_feedforward=state_dim * 4,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal = nn.TransformerEncoder(
+            layer, num_layers=layers, enable_nested_tensor=False
+        )
+        self.output_norm = nn.LayerNorm(state_dim)
+        self.correction = nn.Sequential(
+            nn.Conv2d(state_dim, state_dim, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(state_dim, state_dim, 3, padding=1, bias=False),
+        )
+        # Start near E07C while retaining gradients through the temporal path.
+        self.residual_logit = nn.Parameter(torch.tensor(-2.2))
+        nn.init.normal_(self.temporal_position, mean=0.0, std=0.02)
+
+    def forward(self, state_window: Tensor) -> Tensor:
+        # state_window: [N,W,C,H,W], one exact causal window.
+        if state_window.ndim != 5:
+            raise ValueError(
+                f"expected [N,W,C,H,W], got {tuple(state_window.shape)}"
+            )
+        batch, time, channels, height, width = state_window.shape
+        if time != self.context_frames:
+            raise ValueError(
+                f"expected {self.context_frames} context frames, got {time}"
+            )
+        pooled = F.adaptive_avg_pool2d(
+            state_window.reshape(batch * time, channels, height, width),
+            (self.token_grid, self.token_grid),
+        )
+        spatial = self.token_grid * self.token_grid
+        tokens = pooled.flatten(2).transpose(1, 2)
+        tokens = tokens.reshape(batch, time, spatial, channels)
+        tokens = tokens.permute(0, 2, 1, 3).reshape(batch * spatial, time, channels)
+        tokens = tokens + self.temporal_position
+        causal_mask = torch.triu(
+            torch.ones(time, time, device=tokens.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        tokens = self.temporal(tokens, mask=causal_mask)
+        final = self.output_norm(tokens[:, -1])
+        final = final.reshape(batch, spatial, channels).transpose(1, 2)
+        final = final.reshape(batch, channels, self.token_grid, self.token_grid)
+        correction = self.correction(final)
+        correction = F.interpolate(
+            correction, size=(height, width), mode="bilinear", align_corners=False
+        )
+        return state_window[:, -1] + torch.sigmoid(self.residual_logit) * correction
+
+
 class PerObjectIDM(nn.Module):
     """Infer z_i only from object i's adjacent visual states."""
 
@@ -338,6 +420,10 @@ class BoxingObjectLAM(nn.Module):
         idm_token_grid: int = 8,
         idm_layers: int = 2,
         idm_heads: int = 4,
+        temporal_context: int = 1,
+        temporal_token_grid: int = 8,
+        temporal_layers: int = 2,
+        temporal_heads: int = 4,
         learned_upsampling: bool = False,
         dynamic_mask_weight: float = 0.0,
         edge_weight: float = 0.0,
@@ -355,11 +441,26 @@ class BoxingObjectLAM(nn.Module):
         self.idm_token_grid = idm_token_grid
         self.idm_layers = idm_layers
         self.idm_heads = idm_heads
+        self.temporal_context = temporal_context
+        self.temporal_token_grid = temporal_token_grid
+        self.temporal_layers = temporal_layers
+        self.temporal_heads = temporal_heads
         self.learned_upsampling = learned_upsampling
         self.dynamic_mask_weight = dynamic_mask_weight
         self.edge_weight = edge_weight
         self.object_encoder = SpatialVisualEncoder(
             self.OBJECT_INPUT_CHANNELS[object_input_mode], state_dim, structure_scale
+        )
+        self.temporal_encoder = (
+            CausalTemporalFeatureEncoder(
+                state_dim,
+                context_frames=temporal_context,
+                token_grid=temporal_token_grid,
+                layers=temporal_layers,
+                heads=temporal_heads,
+            )
+            if temporal_context > 1
+            else None
         )
         self.background_encoder = SpatialVisualEncoder(4, state_dim)
         if object_input_mode == "mask_structure_content":
@@ -444,6 +545,32 @@ class BoxingObjectLAM(nn.Module):
             ).reshape(batch, time, 2, self.state_dim)
         return object_states, background_states, content_states
 
+    def _contextualize_object_states(self, object_states: Tensor) -> Tensor:
+        if self.temporal_encoder is None:
+            return object_states
+        batch, time, slots, channels, height, width = object_states.shape
+        if time <= self.temporal_context:
+            raise ValueError(
+                f"temporal_context={self.temporal_context} requires at least "
+                f"{self.temporal_context + 1} frames, got {time}"
+            )
+        contextual = []
+        for end in range(self.temporal_context - 1, time):
+            start = end - self.temporal_context + 1
+            window = object_states[:, start : end + 1]
+            window = window.permute(0, 2, 1, 3, 4, 5).reshape(
+                batch * slots,
+                self.temporal_context,
+                channels,
+                height,
+                width,
+            )
+            encoded = self.temporal_encoder(window)
+            contextual.append(
+                encoded.reshape(batch, slots, channels, height, width)
+            )
+        return torch.stack(contextual, dim=1)
+
     def forward(
         self,
         batch: Dict[str, Tensor],
@@ -459,12 +586,14 @@ class BoxingObjectLAM(nn.Module):
         object_states, background_states, content_states = self._encode_slots(
             videos, masks, background_masks
         )
-        state_t = object_states[:, :-1]
-        state_tp1 = object_states[:, 1:]
+        contextual_states = self._contextualize_object_states(object_states)
+        state_t = contextual_states[:, :-1]
+        state_tp1 = contextual_states[:, 1:]
+        target_start = self.temporal_context
         flat_t = state_t.reshape(-1, self.state_dim, *state_t.shape[-2:])
         flat_tp1 = state_tp1.reshape_as(flat_t)
         z, mu, logvar = self.idm(flat_t, flat_tp1)
-        z = z.reshape(batch_size, time - 1, 2, self.latent_dim)
+        z = z.reshape(batch_size, time - target_start, 2, self.latent_dim)
         mu = mu.reshape_as(z)
         logvar = logvar.reshape_as(z)
         if ablation == "zero":
@@ -498,7 +627,7 @@ class BoxingObjectLAM(nn.Module):
         decoder_states = predicted
         content_used = None
         if content_states is not None:
-            content_used = content_states[:, :-1]
+            content_used = content_states[:, target_start - 1 : -1]
             if content_ablation == "zero":
                 content_used = torch.zeros_like(content_used)
             elif content_ablation == "shuffle":
@@ -517,24 +646,26 @@ class BoxingObjectLAM(nn.Module):
             ).reshape_as(predicted)
         object_logits = self.object_decoder(
             decoder_states.reshape(-1, self.state_dim, *decoder_states.shape[-2:]), (height, width)
-        ).reshape(batch_size, time - 1, 2, 4, height, width)
+        ).reshape(batch_size, time - target_start, 2, 4, height, width)
         object_rgb = torch.sigmoid(object_logits[:, :, :, :3])
         object_mask_logits = object_logits[:, :, :, 3]
         object_alpha = torch.sigmoid(object_mask_logits)
         background_rgb = torch.sigmoid(
             self.background_decoder(
-                background_states[:, :-1].reshape(-1, self.state_dim, *background_states.shape[-2:]),
+                background_states[:, target_start - 1 : -1].reshape(
+                    -1, self.state_dim, *background_states.shape[-2:]
+                ),
                 (height, width),
             )
-        ).reshape(batch_size, time - 1, 3, height, width)
+        ).reshape(batch_size, time - target_start, 3, height, width)
         reconstruction = background_rgb
         for k in range(2):
             alpha = object_alpha[:, :, k].unsqueeze(2)
             reconstruction = alpha * object_rgb[:, :, k] + (1.0 - alpha) * reconstruction
 
-        target_video = videos[:, 1:]
-        target_masks = masks[:, 1:]
-        target_background = background_masks[:, 1:]
+        target_video = videos[:, target_start:]
+        target_masks = masks[:, target_start:]
+        target_background = background_masks[:, target_start:]
         state_loss = F.mse_loss(predicted, state_tp1.detach())
         object_den = target_masks.sum(dim=(-2, -1)).clamp_min(1.0)
         object_l1 = (
@@ -545,7 +676,7 @@ class BoxingObjectLAM(nn.Module):
         negative = (1.0 - target_masks).sum().clamp_min(1.0)
         pos_weight = (negative / positive).detach().clamp(max=100.0)
         mask_bce = F.binary_cross_entropy_with_logits(object_mask_logits, target_masks, pos_weight=pos_weight)
-        current_masks = masks[:, :-1]
+        current_masks = masks[:, target_start - 1 : -1]
         changed = (target_masks - current_masks).abs()
         dynamic_region = F.max_pool2d(
             changed.reshape(-1, 1, height, width), 7, stride=1, padding=3
@@ -621,6 +752,7 @@ class BoxingObjectLAM(nn.Module):
             "z_mu": mu,
             "z_logvar": logvar,
             "object_states": object_states,
+            "contextual_object_states": contextual_states,
             "predicted_object_states": predicted,
             "background_states": background_states,
             "content_states": content_states,
