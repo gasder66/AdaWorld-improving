@@ -137,7 +137,13 @@ def evaluate(
     device: torch.device,
     batch_size: int,
 ) -> Dict:
-    loader = DataLoader(Subset(dataset, list(indices)), batch_size=batch_size, shuffle=False, num_workers=0)
+    ordered_indices = sorted(indices, key=lambda index: dataset.entries[index]["path"])
+    loader = DataLoader(
+        Subset(dataset, ordered_indices),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
     sums: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(float))
     )

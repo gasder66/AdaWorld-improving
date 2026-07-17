@@ -77,8 +77,12 @@ def collect(
     device: torch.device,
     batch_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
+    ordered_indices = sorted(indices, key=lambda index: dataset.entries[index]["path"])
     loader = DataLoader(
-        Subset(dataset, indices), batch_size=batch_size, shuffle=False, num_workers=0,
+        Subset(dataset, ordered_indices),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
     )
     features, labels = [], []
     for raw in loader:

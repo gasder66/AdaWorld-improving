@@ -66,6 +66,8 @@ class BoxingTransitionDataset(Dataset):
             (parent for parent in resolved_index.parents if (parent / "data").is_dir()),
             None,
         )
+        self._cached_sample_path: Path | None = None
+        self._cached_sample: Dict[str, Any] | None = None
         self.stats = index["stats"]
         if not self.entries:
             raise ValueError(f"empty transition index: {index_path}")
@@ -80,7 +82,14 @@ class BoxingTransitionDataset(Dataset):
             parts = sample_path.parts
             if "data" in parts:
                 sample_path = self.project_root.joinpath(*parts[parts.index("data") :])
-        raw = torch.load(sample_path, map_location="cpu", weights_only=False)
+        if sample_path != self._cached_sample_path:
+            self._cached_sample = torch.load(
+                sample_path, map_location="cpu", weights_only=False
+            )
+            self._cached_sample_path = sample_path
+        if self._cached_sample is None:
+            raise RuntimeError(f"failed to load Boxing sample: {sample_path}")
+        raw = self._cached_sample
         t = int(entry["transition"])
         frame_indices = torch.arange(t - self.temporal_context + 1, t + 2)
         videos = raw["videos"].index_select(0, frame_indices).float() / 255.0

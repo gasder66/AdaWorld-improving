@@ -118,7 +118,13 @@ def collect_latents(
     device: torch.device,
     batch_size: int,
 ) -> Dict[str, np.ndarray]:
-    loader = DataLoader(Subset(dataset, list(indices)), batch_size=batch_size, shuffle=False, num_workers=0)
+    ordered_indices = sorted(indices, key=lambda index: dataset.entries[index]["path"])
+    loader = DataLoader(
+        Subset(dataset, ordered_indices),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
     values: Dict[str, List] = defaultdict(list)
     for batch in loader:
         model_batch = {key: batch[key].to(device) for key in ("videos", "masks", "background_masks")}

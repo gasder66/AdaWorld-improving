@@ -126,8 +126,24 @@ This file records milestone experiments for the V16 object-wise Boxing LAM. Indi
 - The transition dataset drops entries without two preceding frames and returns
   four frames per indexed transition. Existing two-frame behavior remains the
   default when `--temporal_context 1`.
-- Initial CPU smoke tests successfully load E07C weights, train the new temporal
-  branch, and preserve high mask reconstruction. Full phase-balanced training
-  and phase/contour/manifold evaluation remain pending GPU availability.
-- It supplies no measurable phase benefit. Six-way linear/MLP balanced accuracy is `0.4613` / `0.5363`, effectively identical to E07C's `0.4617` / `0.5370`.
-- Conclusion: two-frame ST attention is neither a drop-in replacement for the current IDM nor an incremental source of phase semantics. A longer window must be paired with a phase-sensitive self-supervised objective; merely allowing attention over more frames is unlikely to be used when the ordinary one-step reconstruction target is already determined by the final frame pair.
+- Two 3,000-step phase-balanced seeds complete successfully. Their main
+  validation normal/zero/shuffle mask IoU averages `0.9871` / `0.7604` /
+  `0.8286`, so the object latent remains necessary and transition-specific.
+- On 3,000 phase-balanced validation transitions, predicted contour mask IoU
+  improves from E07C's `0.9094` to an E08B two-seed mean of `0.9169`.
+  Dynamic-region IoU improves from `0.7748` to `0.7798`, and dynamic-region L1
+  falls from `0.0449` to `0.0398`. Every punch phase improves, especially
+  extend (`0.8648 -> 0.8791`) and hold (`0.9127 -> 0.9286`).
+- Six-way linear/MLP phase balanced accuracy is `0.4673` / `0.5685` averaged
+  across seeds, compared with E07C's `0.4600` / `0.5583`. The improvement is
+  positive but modest; extend and switch remain heavily confused.
+- Frozen-latent probes show strong movement direction (`0.9374`) and improved
+  punch-active decoding (`0.7479` versus `0.7163`), but interaction decoding
+  does not improve (`0.4266` versus `0.4443`). UMAP/t-SNE shows
+  pose/identity-dependent subclusters rather than one smooth action manifold.
+- Conclusion: causal three-frame feature attention improves contour prediction
+  and selected punch phases, but a longer window alone does not produce a pure
+  phase-organized action representation. The next experiment should pair E08B
+  with a phase-sensitive multi-step or temporal-order objective rather than
+  merely increasing Transformer depth. Full results are in
+  `docs/V16_E08B_FULL_REPORT.md`.
